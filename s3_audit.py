@@ -33,10 +33,11 @@ LOG_FILE = 'auditoria_robo.log'
 # Configuração de Divisão de Arquivos Excel
 ROWS_PER_FILE = 20000
 
-# --- CONFIGURAÇÃO DE PASTA IGNORADA ---
-# O script vai remover esta pasta da lista de varredura inicial (Map & Attack).
-# Certifique-se de que o caminho corresponde a uma das pastas que serão mapeadas na raiz.
-IGNORED_PREFIX = "000000000000010/" 
+# --- CONFIGURAÇÃO DE PASTA IGNORADA (ATUALIZADO) ---
+# Agora você pode colocar um caminho profundo.
+# O script vai "perfurar" (drill down) até achar essa pasta e ignorar SÓ ELA,
+# preservando as irmãs que estão ao lado dela.
+IGNORED_PREFIX = "000000000000010/000000000099999/" 
 
 # ================= CONFIGURAÇÃO DE LOGGING =================
 
@@ -77,41 +78,34 @@ def get_s3_client():
 
 def get_immediate_subfolders(s3_client, bucket, prefix):
     """
-    NOVO: Mapeia apenas as pastas imediatas usando Delimiter='/'.
-    Isso é extremamente rápido e permite filtrar pastas inteiras antes de varrer.
+    Mapeia apenas as pastas imediatas usando Delimiter='/'.
+    Isso é rápido e não lista arquivos, apenas estrutura de pastas.
     """
-    print(f"🗺️  Mapeando pastas na raiz de '{prefix}'...")
-    logging.info(f"Iniciando mapeamento estrutural em: {bucket}/{prefix}")
-    
-    folders = []
-    
     # Garante formato correto do prefixo
     search_prefix = prefix
     if search_prefix and not search_prefix.endswith('/'):
         search_prefix += '/'
-
+        
+    print(f"🗺️  Mapeando estrutura em '{search_prefix}'...")
+    logging.info(f"Mapeando estrutura: {bucket}/{search_prefix}")
+    
+    folders = []
     paginator = s3_client.get_paginator('list_objects_v2')
     
-    # O Delimiter '/' faz a mágica de listar como se fossem pastas de sistema de arquivos
+    # O Delimiter '/' faz a mágica de listar pastas
     iterator = paginator.paginate(Bucket=bucket, Prefix=search_prefix, Delimiter='/')
 
     for page in iterator:
-        # CommonPrefixes contém as "pastas"
         if 'CommonPrefixes' in page:
             for p in page['CommonPrefixes']:
                 folders.append(p['Prefix'])
     
-    # Ordena para garantir consistência entre execuções
     folders.sort()
-    
-    print(f"   -> Encontradas {len(folders)} pastas principais.")
-    logging.info(f"Mapeamento concluído. {len(folders)} pastas identificadas.")
     return folders
 
 def save_checkpoint(folder_stats, all_known_paths, files_found_paths, next_token, total_files, current_folder_idx):
     """
-    Salva o estado.
-    ATUALIZADO: Agora salva também 'folder_idx' para saber em qual pasta da lista paramos.
+    Salva o estado atual e o índice da pasta onde parou.
     """
     logging.info(f"Salvando Checkpoint... (Total: {total_files}, Pasta Index: {current_folder_idx})")
     
@@ -120,19 +114,16 @@ def save_checkpoint(folder_stats, all_known_paths, files_found_paths, next_token
         'all_paths': all_known_paths,
         'file_paths': files_found_paths,
         'total': total_files,
-        'folder_idx': current_folder_idx # Salva o progresso na lista de pastas
+        'folder_idx': current_folder_idx 
     }
     
     try:
         with open(CHECKPOINT_STATS_FILE, 'wb') as f:
             pickle.dump(data_to_save, f)
         
-        # Lógica do Token:
-        # Se tem token, salva ele (estamos no meio de uma pasta).
         if next_token:
             with open(CHECKPOINT_TOKEN_FILE, 'w') as f:
                 f.write(next_token)
-        # Se não tem token (terminamos a pasta e vamos pular pra próxima), limpa o arquivo.
         elif os.path.exists(CHECKPOINT_TOKEN_FILE):
              os.remove(CHECKPOINT_TOKEN_FILE)
              
@@ -142,7 +133,6 @@ def save_checkpoint(folder_stats, all_known_paths, files_found_paths, next_token
 def load_checkpoint():
     """
     Carrega o estado anterior.
-    ATUALIZADO: Retorna também o índice da pasta onde parou.
     """
     if os.path.exists(CHECKPOINT_STATS_FILE):
         print("\n🔄 CHECKPOINT ENCONTRADO! Carregando estado anterior...")
@@ -156,7 +146,6 @@ def load_checkpoint():
                 with open(CHECKPOINT_TOKEN_FILE, 'r') as f:
                     token = f.read().strip()
             
-            # Recupera o índice da pasta (se não existir, assume 0)
             idx = data.get('folder_idx', 0)
             
             print(f"   -> Retomando da pasta nº {idx+1}, Arquivos processados: {data['total']}")
@@ -169,7 +158,6 @@ def load_checkpoint():
             print(f"⚠️ {msg}")
             logging.warning(msg)
     
-    # Retorna valores zerados se não houver checkpoint
     return None, None, None, 0, None, 0
 
 def generate_excel_report(folder_stats, all_known_paths, files_found_paths, status_msg="Concluído com Sucesso"):
@@ -249,29 +237,53 @@ def scan_bucket(bucket_name, root_prefix):
 
     s3 = get_s3_client()
     
-    # --- PASSO 1: MAPEAR PASTAS PRINCIPAIS ---
-    # Isso substitui a varredura cega. Pegamos a lista de pastas primeiro.
-    all_root_folders = get_immediate_subfolders(s3, bucket_name, root_prefix)
+    # --- PASSO 1: Mapeamento Inteligente (Smart Map & Attack) ---
+    print("🔍 Analisando estrutura de pastas...")
     
-    # --- PASSO 2: FILTRAR A PASTA IGNORADA ---
+    # Pega as pastas da Raiz (Nível 1)
+    # Ex: ['00...01/', '00...02/', ..., '00...10/']
+    root_folders = get_immediate_subfolders(s3, bucket_name, root_prefix)
+    
     folders_to_scan = []
-    for f in all_root_folders:
-        # Se a pasta começa com o prefixo que queremos ignorar, pulamos ela da lista.
-        # Assim, nenhuma requisição será feita para dentro dela.
-        if IGNORED_PREFIX and f.startswith(IGNORED_PREFIX):
-            print(f"🚫 Ignorando pasta inteira (Strategy Map & Attack): {f}")
-            logging.info(f"Pasta removida da lista de varredura: {f}")
-            continue
-        folders_to_scan.append(f)
     
-    # Se o bucket não tiver pastas na raiz (flat), adicionamos o próprio root para escanear
-    if not folders_to_scan:
+    for folder in root_folders:
+        # CASO 1: A pasta é exatamente a ignorada (muito raro se tiver subpastas, mas possível)
+        if folder == IGNORED_PREFIX:
+            print(f"🚫 Ignorando pasta exata: {folder}")
+            logging.info(f"Pasta ignorada (Exata): {folder}")
+            continue
+            
+        # CASO 2: A pasta ignorada está DENTRO desta pasta (Drill Down necessário)
+        # Ex: folder='00...10/' e IGNORED='00...10/00...99/'
+        # A string ignorada COMEÇA com o nome da pasta atual.
+        elif IGNORED_PREFIX.startswith(folder):
+            print(f"⚠️  Pasta '{folder}' contém o alvo a ser ignorado. Perfurando (Drill Down)...")
+            logging.info(f"Realizando Drill Down em {folder} para isolar {IGNORED_PREFIX}")
+            
+            # Entra na pasta e lista o Nível 2
+            subfolders = get_immediate_subfolders(s3, bucket_name, folder)
+            
+            # Filtra o Nível 2
+            for sub in subfolders:
+                if sub == IGNORED_PREFIX or sub.startswith(IGNORED_PREFIX):
+                    print(f"   🚫 Ignorando subpasta: {sub}")
+                    logging.info(f"Subpasta ignorada: {sub}")
+                    continue
+                else:
+                    folders_to_scan.append(sub) # Adiciona as irmãs (00...88/, 00...77/)
+        
+        # CASO 3: Pasta normal, segura para varrer
+        else:
+            folders_to_scan.append(folder)
+            
+    # Se o bucket for flat (sem pastas), adiciona a raiz
+    if not folders_to_scan and not root_folders:
         folders_to_scan = [root_prefix]
 
-    print(f"📋 Lista final de varredura: {len(folders_to_scan)} pastas principais.")
+    print(f"📋 Lista final de varredura: {len(folders_to_scan)} caminhos.")
+    logging.info(f"Lista de ataque finalizada. Total de caminhos para varrer: {len(folders_to_scan)}")
 
-    # --- PASSO 3: PREPARAR VARIÁVEIS / CHECKPOINT ---
-    # Carrega onde parou (agora incluindo o folder_idx)
+    # --- PASSO 2: Preparar Variáveis / Checkpoint ---
     stats, paths, files_paths, total_start, start_token, start_folder_idx = load_checkpoint()
     
     if stats:
@@ -286,30 +298,26 @@ def scan_bucket(bucket_name, root_prefix):
         files_found_paths = set()
         total_files = 0
         current_folder_idx = 0
-        start_token = None # Garante que começa limpo se não tiver checkpoint
+        start_token = None 
 
     status_final = "Concluído com Sucesso"
     requests_made = 0
-    ignored_files_count = 0 # Contador para log de arquivos individuais com erro
+    ignored_files_count = 0
     
     paginator = s3.get_paginator('list_objects_v2')
 
-    # --- PASSO 4: LOOP DE "ATAQUE" (PASTA POR PASTA) ---
+    # --- PASSO 3: Loop de Ataque ---
     try:
-        # Iteramos sobre a lista filtrada, começando do índice salvo no checkpoint
         for i in range(current_folder_idx, len(folders_to_scan)):
             
             target = folders_to_scan[i]
-            print(f"\n📂 [{i+1}/{len(folders_to_scan)}] Varrendo pasta: {target}")
+            print(f"\n📂 [{i+1}/{len(folders_to_scan)}] Varrendo: {target}")
             logging.info(f"Iniciando varredura da pasta: {target}")
             
-            # Configuração da Paginação
-            # Só usamos o start_token se estivermos na mesma pasta onde o checkpoint parou.
-            # Se já mudamos de pasta, o token deve ser None (começar do inicio daquela pasta).
             pagination_config = {'PageSize': 1000}
             if start_token and i == current_folder_idx:
                 pagination_config['StartingToken'] = start_token
-                start_token = None # Reseta para as próximas pastas não usarem esse token antigo
+                start_token = None
 
             page_iterator = paginator.paginate(
                 Bucket=bucket_name, 
@@ -319,33 +327,31 @@ def scan_bucket(bucket_name, root_prefix):
 
             pages_since_save = 0
             
-            # Loop interno percorre as páginas daquela pasta específica (com TQDM e Log)
             with tqdm(page_iterator, desc=f"Lendo {target[:20]}...") as pbar:
                 for page in pbar:
                     requests_made += 1
                     pages_since_save += 1
                     
-                    # --- AUTO-SAVE (CHECKPOINT) ---
-                    # Salva referenciando a PASTA ATUAL (i)
                     if 'NextContinuationToken' in page and pages_since_save >= 500:
                         save_checkpoint(folder_stats, all_known_paths, files_found_paths, page['NextContinuationToken'], total_files, i)
                         pages_since_save = 0
 
-                    # --- TRAVA DE SEGURANÇA ---
                     if MAX_REQUESTS_SAFETY > 0 and requests_made > MAX_REQUESTS_SAFETY:
                         status_final = f"Interrompido (Limite: {MAX_REQUESTS_SAFETY})"
                         logging.warning("Limite de segurança atingido.")
-                        raise StopIteration("Limite Atingido") # Força saída dos loops
+                        raise StopIteration("Limite Atingido")
 
                     if 'Contents' not in page: continue
 
-                    # Processamento dos arquivos
                     for obj in page['Contents']:
                         try:
-                            # --- TRATAMENTO DE ERRO POR ARQUIVO ---
                             key = obj['Key']
+                            # Última linha de defesa (caso tenha passado algo estranho)
+                            if key.startswith(IGNORED_PREFIX):
+                                ignored_files_count += 1
+                                continue
+
                             last_modified = obj['LastModified']
-                            
                             if key.endswith('/'):
                                 all_known_paths.add(key)
                                 continue
@@ -354,7 +360,6 @@ def scan_bucket(bucket_name, root_prefix):
                             if not folder_path: folder_path = "Raiz"
                             files_found_paths.add(folder_path)
                             
-                            # Hierarquia
                             parts = folder_path.split('/')
                             current_build = ""
                             for part in parts:
@@ -367,44 +372,34 @@ def scan_bucket(bucket_name, root_prefix):
                             total_files += 1
 
                         except Exception as e_file:
-                            # Se um arquivo falhar, loga e continua o próximo
                             ignored_files_count += 1
-                            logging.error(f"Erro ao processar arquivo individual: {e_file}")
+                            logging.error(f"Erro arq individual: {e_file}")
                             continue
 
                     pbar.set_postfix({'Total': total_files})
-                    
-                    # Guarda token atual para caso de crash/ctrl+c
                     current_next_token = page.get('NextContinuationToken', None)
 
-            # --- FIM DA PASTA ---
-            # Se terminou a pasta com sucesso, salvamos checkpoint apontando para a PRÓXIMA (i+1)
-            # e com token None (começar do zero na próxima).
             save_checkpoint(folder_stats, all_known_paths, files_found_paths, None, total_files, i + 1)
 
     except (KeyboardInterrupt, StopIteration):
-        print("\n⚠️ Parada solicitada (Ctrl+C ou Limite).")
+        print("\n⚠️ Parada solicitada.")
         if status_final == "Concluído com Sucesso": status_final = "Cancelado pelo Usuário"
         
-        # Salva exatamente onde parou
         if 'current_next_token' in locals() and current_next_token:
-            # Parou no meio de uma pasta
-            save_checkpoint(folder_stats, all_known_paths, files_found_paths, current_next_token, total_files, i) # Usa 'i' atual
+            save_checkpoint(folder_stats, all_known_paths, files_found_paths, current_next_token, total_files, i)
         else:
-            # Parou entre pastas
             save_checkpoint(folder_stats, all_known_paths, files_found_paths, None, total_files, i)
 
     except Exception as e:
         print(f"\n❌ ERRO CRÍTICO: {e}")
-        logging.critical(f"Erro fatal no loop principal: {e}", exc_info=True)
+        logging.critical(f"Erro fatal: {e}", exc_info=True)
         status_final = f"Erro: {str(e)}"
-        # Tenta salvar emergência
         if 'current_next_token' in locals() and current_next_token:
              save_checkpoint(folder_stats, all_known_paths, files_found_paths, current_next_token, total_files, i)
 
     finally:
         print(f"\nFinalizado. Total acumulado: {total_files}")
-        logging.info(f"Varredura encerrada. Total: {total_files}. Erros Individuais: {ignored_files_count}")
+        logging.info(f"Fim. Total: {total_files}. Ignorados/Erros: {ignored_files_count}")
         generate_excel_report(folder_stats, all_known_paths, files_found_paths, status_msg=status_final)
 
 if __name__ == "__main__":
