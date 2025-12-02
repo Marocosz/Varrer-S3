@@ -26,6 +26,9 @@ from dotenv import load_dotenv
 # 'pandas': A biblioteca padrão para manipulação de dados tabulares e Excel.
 import pandas as pd
 
+# 'math': Usado para calcular quantos arquivos (partes) serão necessários (arredondamento para cima).
+import math
+
 # ================= CARREGAMENTO DE AMBIENTE =================
 
 load_dotenv()
@@ -40,9 +43,14 @@ except ValueError:
     MAX_REQUESTS_SAFETY = 0
 
 # Configurações de Arquivos
-OUTPUT_FILE = 'relatorio_s3_matriz.xlsx' # Nome alterado para refletir o novo formato
+OUTPUT_FILE = 'relatorio_s3_matriz.xlsx'
 CHECKPOINT_STATS_FILE = 'checkpoint_stats.pkl' # Arquivo binário com a contagem atual
 CHECKPOINT_TOKEN_FILE = 'checkpoint_token.txt' # Arquivo texto com o "marcador" da AWS
+
+# --- NOVO: CONFIGURAÇÃO DE DIVISÃO DE ARQUIVOS ---
+# Define quantas linhas de dados (pastas) cada arquivo Excel terá no máximo.
+# Se passar disso, o script cria automaticamente "parte_1", "parte_2", etc.
+ROWS_PER_FILE = 20000
 
 # ================= FUNÇÕES DO SISTEMA =================
 
@@ -115,17 +123,15 @@ def load_checkpoint():
 def generate_excel_report(folder_stats, all_known_paths, files_found_paths, status_msg="Concluído com Sucesso"):
     """
     Gera o relatório em formato de MATRIZ (Tabela Dinâmica).
-    Linhas = Pastas únicas
-    Colunas = Anos
+    --- ATUALIZAÇÃO: DIVISÃO DE ARQUIVOS ---
+    Se o número de linhas exceder ROWS_PER_FILE, divide em múltiplos arquivos Excel.
     """
-    print(f"\n💾 Gerando Matriz Excel em {OUTPUT_FILE}...")
+    print(f"\n💾 Compilando dados para Excel...")
     
     # 1. PREPARAÇÃO E NORMALIZAÇÃO
-    # Transformar o dicionário aninhado em uma lista plana para o Pandas
     data_rows = []
     
     # Normaliza chaves para garantir unicidade e evitar o bug de linhas duplicadas.
-    # Criamos um novo dicionário onde removemos a barra final '/' de todas as pastas.
     normalized_stats = defaultdict(lambda: defaultdict(int))
     
     for raw_folder, years in folder_stats.items():
@@ -147,57 +153,79 @@ def generate_excel_report(folder_stats, all_known_paths, files_found_paths, stat
 
     # 2. CRIAÇÃO DA MATRIZ (PIVOT TABLE)
     df = pd.DataFrame(data_rows)
+    df_matrix = pd.DataFrame()
 
     if not df.empty:
         # A MÁGICA: Pivot Table transforma linhas (anos) em colunas.
-        # fill_value=0 garante que se a pasta não tem arquivo em 2020, aparece 0.
         df_matrix = df.pivot_table(index='Pasta', columns='Ano', values='Arquivos', fill_value=0)
         
-        # Adiciona coluna de Total Geral por pasta (soma horizontal)
+        # Adiciona coluna de Total Geral por pasta
         df_matrix['Total Geral'] = df_matrix.sum(axis=1)
         
         # Ordena alfabeticamente pelo nome da pasta
         df_matrix = df_matrix.sort_index()
     else:
-        # Se não achou nada, cria tabela vazia
         df_matrix = pd.DataFrame(columns=["Pasta", "Total Geral"])
 
     # 3. TRATAMENTO DE PASTAS VAZIAS (ESTRUTURAIS)
-    # Identifica pastas que existem na estrutura (all_known_paths) mas não tiveram arquivos (normalized_stats)
     all_clean_paths = {p.rstrip('/') for p in all_known_paths if p.rstrip('/')}
     stats_clean_paths = set(normalized_stats.keys())
-    
-    # Subtração de conjuntos: Tudo que existe menos o que tem arquivo = Pastas Vazias
     empty_folders = sorted(list(all_clean_paths - stats_clean_paths))
     
-    # Cria um DataFrame separado só para as vazias para não poluir a matriz principal
+    df_empty = pd.DataFrame()
     if empty_folders:
         df_empty = pd.DataFrame({'Pasta': empty_folders})
         df_empty['Status'] = 'Vazia ou Apenas Subpastas'
-    else:
-        df_empty = pd.DataFrame()
 
-    # 4. SALVAMENTO NO EXCEL
+    # Cria tabela de Resumo
+    df_resumo = pd.DataFrame([
+        {"Item": "Status da Execução", "Valor": status_msg},
+        {"Item": "Data do Relatório", "Valor": datetime.now().strftime('%d/%m/%Y %H:%M:%S')},
+        {"Item": "Total de Arquivos Listados", "Valor": df_matrix['Total Geral'].sum() if not df_matrix.empty else 0},
+        {"Item": "Bucket", "Valor": BUCKET_NAME}
+    ])
+
+    # 4. LÓGICA DE DIVISÃO (SPLIT) E SALVAMENTO
+    total_rows = len(df_matrix)
+    
+    # Calcula quantos arquivos serão necessários (ex: 25000 linhas / 10000 limit = 3 arquivos)
+    num_files = math.ceil(total_rows / ROWS_PER_FILE) if total_rows > 0 else 1
+
+    print(f"   -> Total de linhas na matriz: {total_rows}")
+    if num_files > 1:
+        print(f"   -> O arquivo será dividido em {num_files} partes (limite: {ROWS_PER_FILE} linhas/arquivo).")
+
     try:
-        with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
+        for i in range(num_files):
+            # Define o início e fim do pedaço (slice) atual
+            start_row = i * ROWS_PER_FILE
+            end_row = start_row + ROWS_PER_FILE
             
-            # Aba 1: A Matriz Principal (O que você quer ver organizado)
-            df_matrix.to_excel(writer, sheet_name='Matriz de Arquivos')
+            # Cria o pedaço do DataFrame
+            df_chunk = df_matrix.iloc[start_row:end_row]
             
-            # Aba 2: Pastas Vazias (Para auditoria, caso precise saber quais pastas não tem nada)
-            if not df_empty.empty:
-                df_empty.to_excel(writer, sheet_name='Pastas Vazias', index=False)
-            
-            # Aba 3: Resumo Técnico (Metadados da execução)
-            df_resumo = pd.DataFrame([
-                {"Item": "Status", "Valor": status_msg},
-                {"Item": "Data", "Valor": datetime.now().strftime('%d/%m/%Y %H:%M:%S')},
-                {"Item": "Total de Arquivos Listados", "Valor": df_matrix['Total Geral'].sum() if not df_matrix.empty else 0},
-                {"Item": "Bucket", "Valor": BUCKET_NAME}
-            ])
-            df_resumo.to_excel(writer, sheet_name='Resumo', index=False)
-            
-        print("✅ Relatório Matriz salvo com sucesso!")
+            # Define o nome do arquivo
+            if num_files > 1:
+                # Se tiver partes: relatorio_parte_1.xlsx, relatorio_parte_2.xlsx
+                current_filename = OUTPUT_FILE.replace('.xlsx', f'_parte_{i+1}.xlsx')
+            else:
+                # Se couber tudo num só, usa o nome original
+                current_filename = OUTPUT_FILE
+
+            print(f"      Salvando {current_filename} (Linhas {start_row} a {min(end_row, total_rows)})...")
+
+            with pd.ExcelWriter(current_filename, engine='openpyxl') as writer:
+                # Aba Principal (O Pedaço da Matriz)
+                df_chunk.to_excel(writer, sheet_name='Matriz de Arquivos')
+                
+                # Para não ficar repetitivo, salvamos o Resumo e as Pastas Vazias APENAS no arquivo da Parte 1
+                # ou no arquivo único se não houver divisão.
+                if i == 0:
+                    df_resumo.to_excel(writer, sheet_name='Resumo', index=False)
+                    if not df_empty.empty:
+                        df_empty.to_excel(writer, sheet_name='Pastas Vazias', index=False)
+        
+        print(f"✅ Todos os relatórios Excel salvos com sucesso!")
         
     except Exception as e:
         print(f"❌ Erro ao salvar Excel: {e}")
