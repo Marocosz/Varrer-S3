@@ -1,1 +1,96 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Byte-compiled
+*.pyo
+*.pyd
+
+# --- Virtual Environments ---
+venv/
+env/
+.venv/
+.vscode/
+.uv/
+.conda/
+venvvarrs3/
+venv*/          # qualquer venv nomeado
+
+# --- Build / Distribuição ---
+build/
+dist/
+*.egg-info/
+*.egg
+*.manifest
+*.spec
+
+# Packaging
+pip-wheel-metadata/
+.installed.cfg
+
+# --- Logs ---
+logs/
+*.log
+
+# --- Banco local / SQLite ---
+*.db
+*.sqlite3
+
+# --- Config / Credenciais ---
 .env
+.env.*
+*.pem
+*.crt
+*.key
+secret.json
+credentials.json
+
+# --- Cache ---
+.cache/
+*.cache/
+*.temp
+*.tmp
+
+# --- Ferramentas Python ---
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+coverage.xml
+htmlcov/
+
+# --- IDEs ---
+.idea/
+.vscode/
+*.code-workspace
+
+# JetBrains
+*.iml
+*.ipr
+*.iws
+out/
+
+# --- Docker ---
+*.pid
+__MACOSX/
+
+# --- S3 Artifacts or temp batches ---
+tmp/
+temp/
+*.bak
+
+# --- Windows ---
+Thumbs.db
+Desktop.ini
+
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# --- Node (caso use front junto) ---
+node_modules/
+npm-debug.log
+yarn-error.log
+pnpm-lock.yaml
+
