@@ -23,6 +23,10 @@ from tqdm import tqdm
 # 'dotenv': Carrega variáveis do arquivo .env.
 from dotenv import load_dotenv
 
+# --- NOVO ---
+# 'pandas': A biblioteca padrão para manipulação de dados tabulares e Excel.
+import pandas as pd
+
 # ================= CARREGAMENTO DE AMBIENTE =================
 
 load_dotenv()
@@ -37,7 +41,8 @@ except ValueError:
     MAX_REQUESTS_SAFETY = 0
 
 # Configurações de Arquivos
-OUTPUT_FILE = 'relatorio_s3.md'
+# Alterado para .xlsx para suportar o formato Excel
+OUTPUT_FILE = 'relatorio_s3.xlsx'
 CHECKPOINT_STATS_FILE = 'checkpoint_stats.pkl' # Arquivo binário com a contagem atual
 CHECKPOINT_TOKEN_FILE = 'checkpoint_token.txt' # Arquivo texto com o "marcador" da AWS
 
@@ -109,61 +114,77 @@ def load_checkpoint():
     # Se não houver checkpoint, retorna tudo vazio/zero
     return None, None, None, 0, None
 
-def generate_markdown_report(folder_stats, all_known_paths, files_found_paths, status_msg="Concluído com Sucesso"):
+def generate_excel_report(folder_stats, all_known_paths, files_found_paths, status_msg="Concluído com Sucesso"):
     """
-    Gera o arquivo físico (.md) com os dados organizados.
+    Gera o arquivo Excel (.xlsx) com duas abas: Resumo e Dados Detalhados.
+    Substitui a antiga função generate_markdown_report.
     """
-    print(f"\n💾 Salvando relatório em {OUTPUT_FILE}...")
+    print(f"\n💾 Compilando dados para Excel em {OUTPUT_FILE}...")
     
+    # 1. PREPARAÇÃO DOS DADOS PARA O EXCEL
+    # Em vez de escrever texto, vamos criar uma lista de dicionários (linhas da tabela)
+    rows = []
     sorted_folders = sorted(list(all_known_paths | files_found_paths))
-    
-    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-        f.write(f"# Relatório de Auditoria S3\n")
-        f.write(f"**Status:** {status_msg}\n")
-        f.write(f"**Data:** {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
-        f.write(f"**Bucket:** `{BUCKET_NAME}`\n")
+
+    for folder in sorted_folders:
+        search_key = folder.rstrip('/')
+        if search_key == "": search_key = "Raiz"
+
+        # CASO 1: Pasta com arquivos
+        if search_key in folder_stats:
+            years_data = folder_stats[search_key]
+            # Para cada ano encontrado na pasta, cria uma linha na tabela
+            for year, count in sorted(years_data.items()):
+                rows.append({
+                    "Pasta": search_key,
+                    "Status da Pasta": "Contém Arquivos",
+                    "Ano": year,
+                    "Quantidade de Arquivos": count
+                })
         
-        filter_used = TARGET_FOLDER if TARGET_FOLDER else "(Raiz Total)"
-        f.write(f"**Filtro (Prefix):** `{filter_used}`\n")
+        # CASO 2: Pasta apenas estrutural (subpastas)
+        elif folder in all_known_paths and search_key not in files_found_paths:
+            rows.append({
+                "Pasta": search_key,
+                "Status da Pasta": "Apenas Subpastas",
+                "Ano": "-",
+                "Quantidade de Arquivos": 0
+            })
+        
+        # CASO 3: Pasta Vazia
+        else:
+            rows.append({
+                "Pasta": search_key,
+                "Status da Pasta": "Vazia",
+                "Ano": "-",
+                "Quantidade de Arquivos": 0
+            })
 
-        if MAX_REQUESTS_SAFETY > 0:
-             f.write(f"**⚠️ Limite de Segurança:** Ativo ({MAX_REQUESTS_SAFETY} requisições máx)\n")
-
-        f.write("---\n\n")
-
-        for folder in sorted_folders:
-            search_key = folder.rstrip('/')
-            if search_key == "": search_key = "Raiz"
-            
-            f.write(f"### 📂 `{search_key}`\n")
-
-            if search_key in folder_stats:
-                years_data = folder_stats[search_key]
-                sorted_years = sorted(years_data.keys())
-                
-                f.write("| Ano | Qtd. Arquivos |\n")
-                f.write("| :--- | :--- |\n")
-                
-                total_local = 0
-                for year in sorted_years:
-                    count = years_data[year]
-                    total_local += count
-                    f.write(f"| {year} | {count} |\n")
-                
-                f.write(f"\n**Total nesta pasta:** {total_local} arquivos\n")
-            
-            elif folder in all_known_paths and search_key not in files_found_paths:
-                 f.write("> *ℹ️ Esta pasta contém apenas subpastas.*\n")
-            
-            else:
-                 f.write("> *Pasta vazia.*\n")
-
-            f.write("\n---\n")
-
-    print("✅ Relatório salvo!")
+    # 2. CRIAÇÃO DOS DATAFRAMES (Tabelas do Pandas)
+    df_detalhes = pd.DataFrame(rows)
     
+    # Cria uma tabela de resumo com metadados da execução
+    df_resumo = pd.DataFrame([
+        {"Item": "Status da Execução", "Valor": status_msg},
+        {"Item": "Data do Relatório", "Valor": datetime.now().strftime('%d/%m/%Y %H:%M:%S')},
+        {"Item": "Bucket Analisado", "Valor": BUCKET_NAME},
+        {"Item": "Filtro Aplicado (Prefix)", "Valor": TARGET_FOLDER if TARGET_FOLDER else "(Raiz Total)"},
+        {"Item": "Trava de Segurança", "Valor": f"Ativa ({MAX_REQUESTS_SAFETY})" if MAX_REQUESTS_SAFETY > 0 else "Desativada"},
+        {"Item": "Total de Pastas Listadas", "Valor": len(sorted_folders)}
+    ])
+
+    # 3. GRAVAÇÃO DO ARQUIVO EXCEL
+    # Usamos o ExcelWriter para poder salvar múltiplas abas no mesmo arquivo
+    try:
+        with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
+            df_resumo.to_excel(writer, sheet_name='Resumo', index=False)
+            df_detalhes.to_excel(writer, sheet_name='Dados Detalhados', index=False)
+        print("✅ Relatório Excel salvo com sucesso!")
+    except Exception as e:
+        print(f"❌ Erro ao salvar Excel: {e}")
+        print("Verifique se o arquivo não está aberto em outro programa.")
+
     # LIMPEZA: Se o script terminou com SUCESSO total, deletamos os checkpoints
-    # para que na próxima execução ele comece do zero limpo.
     if "Sucesso" in status_msg:
         if os.path.exists(CHECKPOINT_STATS_FILE): os.remove(CHECKPOINT_STATS_FILE)
         if os.path.exists(CHECKPOINT_TOKEN_FILE): os.remove(CHECKPOINT_TOKEN_FILE)
@@ -299,7 +320,8 @@ def scan_bucket(bucket_name, prefix_folder):
     finally:
         # Este bloco SEMPRE roda no final, dando erro ou sucesso.
         print(f"\nProcesso finalizado. Total acumulado: {total_files} arquivos.")
-        generate_markdown_report(folder_stats, all_known_paths, files_found_paths, status_msg=status_final)
+        # Chamamos a nova função de Excel aqui
+        generate_excel_report(folder_stats, all_known_paths, files_found_paths, status_msg=status_final)
 
 if __name__ == "__main__":
     scan_bucket(BUCKET_NAME, TARGET_FOLDER)
