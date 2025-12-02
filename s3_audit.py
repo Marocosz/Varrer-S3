@@ -1,14 +1,35 @@
 # ================= IMPORTS E BIBLIOTECAS =================
 
+# 'boto3': O SDK oficial da AWS. É a ponte entre o Python e a nuvem.
 import boto3
+
+# 'os': Permite interagir com o sistema operacional e arquivos.
 import os
+
+# 'pickle': Biblioteca nativa do Python para serializar objetos.
+# Ela permite salvar dicionários complexos da memória para um arquivo no disco
+# e carregá-los de volta exatamente como estavam. Essencial para o Checkpoint.
 import pickle
+
+# 'defaultdict': Dicionário inteligente com valores padrão.
 from collections import defaultdict
+
+# 'datetime': Para datas no relatório.
 from datetime import datetime
+
+# 'tqdm': Barra de progresso visual.
 from tqdm import tqdm
+
+# 'dotenv': Carrega variáveis do arquivo .env.
 from dotenv import load_dotenv
+
+# 'pandas': A biblioteca padrão para manipulação de dados tabulares e Excel.
 import pandas as pd
+
+# 'math': Usado para calcular quantos arquivos (partes) serão necessários.
 import math
+
+# 'logging': Biblioteca para criar o arquivo de LOG (registro de atividades).
 import logging
 
 # ================= CARREGAMENTO DE AMBIENTE =================
@@ -26,17 +47,16 @@ except ValueError:
 
 # Configurações de Arquivos
 OUTPUT_FILE = 'relatorio_s3_matriz.xlsx'
-CHECKPOINT_STATS_FILE = 'checkpoint_stats.pkl'
-CHECKPOINT_TOKEN_FILE = 'checkpoint_token.txt'
+CHECKPOINT_STATS_FILE = 'checkpoint_stats.pkl' # Arquivo binário com a contagem atual
+CHECKPOINT_TOKEN_FILE = 'checkpoint_token.txt' # Arquivo texto com o "marcador" da AWS
 LOG_FILE = 'auditoria_robo.log'
 
 # Configuração de Divisão de Arquivos Excel
 ROWS_PER_FILE = 20000
 
-# --- CONFIGURAÇÃO DE PASTA IGNORADA (ATUALIZADO) ---
-# Agora você pode colocar um caminho profundo.
-# O script vai "perfurar" (drill down) até achar essa pasta e ignorar SÓ ELA,
-# preservando as irmãs que estão ao lado dela.
+# --- CONFIGURAÇÃO DE PASTA IGNORADA ---
+# O script vai tentar remover esta pasta da lista de varredura inicial (Map & Attack).
+# Como ela é uma subpasta (Nível 2), o script fará um "Drill Down" para encontrá-la e removê-la.
 IGNORED_PREFIX = "000000000000010/000000000099999/" 
 
 # ================= CONFIGURAÇÃO DE LOGGING =================
@@ -51,15 +71,18 @@ logging.basicConfig(
 
 # ================= FUNÇÕES AUXILIARES =================
 
+# --- CORREÇÃO DO ERRO DO PICKLE (CTRL+C) ---
+# Esta função SUBSTITUI o lambda. Ela precisa estar no escopo global 
+# para que o pickle consiga salvar o checkpoint sem erros.
 def create_nested_defaultdict():
-    """
-    Função global necessária para o pickle salvar o defaultdict corretamente.
-    """
     return defaultdict(int)
 
 # ================= FUNÇÕES DO SISTEMA =================
 
 def get_s3_client():
+    """
+    Cria e retorna o cliente de conexão com o S3.
+    """
     aws_access_key = os.getenv('AWS_ACCESS_KEY_ID')
     aws_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
     aws_region = os.getenv('AWS_REGION')
@@ -79,7 +102,7 @@ def get_s3_client():
 def get_immediate_subfolders(s3_client, bucket, prefix):
     """
     Mapeia apenas as pastas imediatas usando Delimiter='/'.
-    Isso é rápido e não lista arquivos, apenas estrutura de pastas.
+    Isso é rápido e permite a estratégia de 'Map & Attack'.
     """
     # Garante formato correto do prefixo
     search_prefix = prefix
@@ -92,7 +115,7 @@ def get_immediate_subfolders(s3_client, bucket, prefix):
     folders = []
     paginator = s3_client.get_paginator('list_objects_v2')
     
-    # O Delimiter '/' faz a mágica de listar pastas
+    # O Delimiter '/' faz a mágica de listar pastas sem ler os arquivos dentro
     iterator = paginator.paginate(Bucket=bucket, Prefix=search_prefix, Delimiter='/')
 
     for page in iterator:
@@ -105,7 +128,7 @@ def get_immediate_subfolders(s3_client, bucket, prefix):
 
 def save_checkpoint(folder_stats, all_known_paths, files_found_paths, next_token, total_files, current_folder_idx):
     """
-    Salva o estado atual e o índice da pasta onde parou.
+    Salva o 'estado' atual do script no disco, incluindo em qual pasta da lista estamos.
     """
     logging.info(f"Salvando Checkpoint... (Total: {total_files}, Pasta Index: {current_folder_idx})")
     
@@ -132,7 +155,7 @@ def save_checkpoint(folder_stats, all_known_paths, files_found_paths, next_token
 
 def load_checkpoint():
     """
-    Carrega o estado anterior.
+    Verifica se existem arquivos de checkpoint salvos e tenta carregá-los.
     """
     if os.path.exists(CHECKPOINT_STATS_FILE):
         print("\n🔄 CHECKPOINT ENCONTRADO! Carregando estado anterior...")
@@ -161,11 +184,16 @@ def load_checkpoint():
     return None, None, None, 0, None, 0
 
 def generate_excel_report(folder_stats, all_known_paths, files_found_paths, status_msg="Concluído com Sucesso"):
+    """
+    Gera o relatório em formato de MATRIZ com suporte a divisão de arquivos (Split).
+    """
     print(f"\n💾 Compilando dados para Excel...")
-    logging.info("Gerando Excel...")
+    logging.info("Iniciando compilação e geração dos arquivos Excel...")
     
+    # 1. PREPARAÇÃO E NORMALIZAÇÃO
     data_rows = []
-    normalized_stats = defaultdict(create_nested_defaultdict)
+    # Usa a função global para evitar erros de pickle
+    normalized_stats = defaultdict(create_nested_defaultdict) 
     
     for raw_folder, years in folder_stats.items():
         clean_folder = raw_folder.rstrip('/')
@@ -177,6 +205,7 @@ def generate_excel_report(folder_stats, all_known_paths, files_found_paths, stat
         for year, count in years_data.items():
             data_rows.append({'Pasta': folder, 'Ano': year, 'Arquivos': count})
 
+    # 2. CRIAÇÃO DA MATRIZ
     df = pd.DataFrame(data_rows)
     df_matrix = pd.DataFrame()
 
@@ -187,6 +216,7 @@ def generate_excel_report(folder_stats, all_known_paths, files_found_paths, stat
     else:
         df_matrix = pd.DataFrame(columns=["Pasta", "Total Geral"])
 
+    # 3. TRATAMENTO DE PASTAS VAZIAS
     all_clean_paths = {p.rstrip('/') for p in all_known_paths if p.rstrip('/')}
     stats_clean_paths = set(normalized_stats.keys())
     empty_folders = sorted(list(all_clean_paths - stats_clean_paths))
@@ -195,15 +225,21 @@ def generate_excel_report(folder_stats, all_known_paths, files_found_paths, stat
     if empty_folders:
         df_empty = pd.DataFrame({'Pasta': empty_folders, 'Status': 'Vazia ou Apenas Subpastas'})
 
+    # Resumo com Metadados
     df_resumo = pd.DataFrame([
-        {"Item": "Status", "Valor": status_msg},
-        {"Item": "Data", "Valor": datetime.now().strftime('%d/%m/%Y %H:%M:%S')},
+        {"Item": "Status da Execução", "Valor": status_msg},
+        {"Item": "Data do Relatório", "Valor": datetime.now().strftime('%d/%m/%Y %H:%M:%S')},
         {"Item": "Total Arquivos", "Valor": df_matrix['Total Geral'].sum() if not df_matrix.empty else 0},
+        {"Item": "Bucket", "Valor": BUCKET_NAME},
         {"Item": "Pasta Ignorada", "Valor": IGNORED_PREFIX}
     ])
 
+    # 4. SALVAMENTO COM DIVISÃO (SPLIT)
     total_rows = len(df_matrix)
     num_files = math.ceil(total_rows / ROWS_PER_FILE) if total_rows > 0 else 1
+
+    print(f"   -> Total de linhas na matriz: {total_rows}")
+    logging.info(f"Total de linhas na matriz: {total_rows}. Dividindo em {num_files} arquivos.")
 
     try:
         for i in range(num_files):
@@ -211,8 +247,12 @@ def generate_excel_report(folder_stats, all_known_paths, files_found_paths, stat
             end_row = start_row + ROWS_PER_FILE
             df_chunk = df_matrix.iloc[start_row:end_row]
             
-            fname = OUTPUT_FILE.replace('.xlsx', f'_parte_{i+1}.xlsx') if num_files > 1 else OUTPUT_FILE
-            print(f"      Salvando {fname}...")
+            if num_files > 1:
+                fname = OUTPUT_FILE.replace('.xlsx', f'_parte_{i+1}.xlsx') 
+            else:
+                fname = OUTPUT_FILE
+                
+            print(f"      Salvando {fname} (Linhas {start_row}-{min(end_row, total_rows)})...")
             
             with pd.ExcelWriter(fname, engine='openpyxl') as writer:
                 df_chunk.to_excel(writer, sheet_name='Matriz')
@@ -226,6 +266,7 @@ def generate_excel_report(folder_stats, all_known_paths, files_found_paths, stat
         logging.error(f"Erro ao salvar Excel: {e}")
         print(f"❌ Erro ao salvar Excel: {e}")
 
+    # Limpeza de checkpoints se sucesso total
     if "Sucesso" in status_msg:
         if os.path.exists(CHECKPOINT_STATS_FILE): os.remove(CHECKPOINT_STATS_FILE)
         if os.path.exists(CHECKPOINT_TOKEN_FILE): os.remove(CHECKPOINT_TOKEN_FILE)
@@ -241,13 +282,12 @@ def scan_bucket(bucket_name, root_prefix):
     print("🔍 Analisando estrutura de pastas...")
     
     # Pega as pastas da Raiz (Nível 1)
-    # Ex: ['00...01/', '00...02/', ..., '00...10/']
     root_folders = get_immediate_subfolders(s3, bucket_name, root_prefix)
     
     folders_to_scan = []
     
     for folder in root_folders:
-        # CASO 1: A pasta é exatamente a ignorada (muito raro se tiver subpastas, mas possível)
+        # CASO 1: A pasta é exatamente a ignorada
         if folder == IGNORED_PREFIX:
             print(f"🚫 Ignorando pasta exata: {folder}")
             logging.info(f"Pasta ignorada (Exata): {folder}")
@@ -255,7 +295,6 @@ def scan_bucket(bucket_name, root_prefix):
             
         # CASO 2: A pasta ignorada está DENTRO desta pasta (Drill Down necessário)
         # Ex: folder='00...10/' e IGNORED='00...10/00...99/'
-        # A string ignorada COMEÇA com o nome da pasta atual.
         elif IGNORED_PREFIX.startswith(folder):
             print(f"⚠️  Pasta '{folder}' contém o alvo a ser ignorado. Perfurando (Drill Down)...")
             logging.info(f"Realizando Drill Down em {folder} para isolar {IGNORED_PREFIX}")
@@ -270,7 +309,7 @@ def scan_bucket(bucket_name, root_prefix):
                     logging.info(f"Subpasta ignorada: {sub}")
                     continue
                 else:
-                    folders_to_scan.append(sub) # Adiciona as irmãs (00...88/, 00...77/)
+                    folders_to_scan.append(sub) # Adiciona as irmãs
         
         # CASO 3: Pasta normal, segura para varrer
         else:
@@ -308,6 +347,7 @@ def scan_bucket(bucket_name, root_prefix):
 
     # --- PASSO 3: Loop de Ataque ---
     try:
+        # Itera sobre as pastas filtradas
         for i in range(current_folder_idx, len(folders_to_scan)):
             
             target = folders_to_scan[i]
@@ -332,10 +372,12 @@ def scan_bucket(bucket_name, root_prefix):
                     requests_made += 1
                     pages_since_save += 1
                     
+                    # Checkpoint Automático
                     if 'NextContinuationToken' in page and pages_since_save >= 500:
                         save_checkpoint(folder_stats, all_known_paths, files_found_paths, page['NextContinuationToken'], total_files, i)
                         pages_since_save = 0
 
+                    # Trava de Segurança
                     if MAX_REQUESTS_SAFETY > 0 and requests_made > MAX_REQUESTS_SAFETY:
                         status_final = f"Interrompido (Limite: {MAX_REQUESTS_SAFETY})"
                         logging.warning("Limite de segurança atingido.")
@@ -346,7 +388,7 @@ def scan_bucket(bucket_name, root_prefix):
                     for obj in page['Contents']:
                         try:
                             key = obj['Key']
-                            # Última linha de defesa (caso tenha passado algo estranho)
+                            # Última linha de defesa (cliente-side)
                             if key.startswith(IGNORED_PREFIX):
                                 ignored_files_count += 1
                                 continue
@@ -379,12 +421,14 @@ def scan_bucket(bucket_name, root_prefix):
                     pbar.set_postfix({'Total': total_files})
                     current_next_token = page.get('NextContinuationToken', None)
 
+            # Fim da pasta: Salva checkpoint apontando para a próxima
             save_checkpoint(folder_stats, all_known_paths, files_found_paths, None, total_files, i + 1)
 
     except (KeyboardInterrupt, StopIteration):
         print("\n⚠️ Parada solicitada.")
         if status_final == "Concluído com Sucesso": status_final = "Cancelado pelo Usuário"
         
+        # Salva exatamente onde parou
         if 'current_next_token' in locals() and current_next_token:
             save_checkpoint(folder_stats, all_known_paths, files_found_paths, current_next_token, total_files, i)
         else:
