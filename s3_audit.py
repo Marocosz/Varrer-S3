@@ -23,7 +23,6 @@ from tqdm import tqdm
 # 'dotenv': Carrega variáveis do arquivo .env.
 from dotenv import load_dotenv
 
-# --- NOVO ---
 # 'pandas': A biblioteca padrão para manipulação de dados tabulares e Excel.
 import pandas as pd
 
@@ -41,8 +40,7 @@ except ValueError:
     MAX_REQUESTS_SAFETY = 0
 
 # Configurações de Arquivos
-# Alterado para .xlsx para suportar o formato Excel
-OUTPUT_FILE = 'relatorio_s3.xlsx'
+OUTPUT_FILE = 'relatorio_s3_matriz.xlsx' # Nome alterado para refletir o novo formato
 CHECKPOINT_STATS_FILE = 'checkpoint_stats.pkl' # Arquivo binário com a contagem atual
 CHECKPOINT_TOKEN_FILE = 'checkpoint_token.txt' # Arquivo texto com o "marcador" da AWS
 
@@ -116,73 +114,94 @@ def load_checkpoint():
 
 def generate_excel_report(folder_stats, all_known_paths, files_found_paths, status_msg="Concluído com Sucesso"):
     """
-    Gera o arquivo Excel (.xlsx) com duas abas: Resumo e Dados Detalhados.
-    Substitui a antiga função generate_markdown_report.
+    Gera o relatório em formato de MATRIZ (Tabela Dinâmica).
+    Linhas = Pastas únicas
+    Colunas = Anos
     """
-    print(f"\n💾 Compilando dados para Excel em {OUTPUT_FILE}...")
+    print(f"\n💾 Gerando Matriz Excel em {OUTPUT_FILE}...")
     
-    # 1. PREPARAÇÃO DOS DADOS PARA O EXCEL
-    # Em vez de escrever texto, vamos criar uma lista de dicionários (linhas da tabela)
-    rows = []
-    sorted_folders = sorted(list(all_known_paths | files_found_paths))
-
-    for folder in sorted_folders:
-        search_key = folder.rstrip('/')
-        if search_key == "": search_key = "Raiz"
-
-        # CASO 1: Pasta com arquivos
-        if search_key in folder_stats:
-            years_data = folder_stats[search_key]
-            # Para cada ano encontrado na pasta, cria uma linha na tabela
-            for year, count in sorted(years_data.items()):
-                rows.append({
-                    "Pasta": search_key,
-                    "Status da Pasta": "Contém Arquivos",
-                    "Ano": year,
-                    "Quantidade de Arquivos": count
-                })
+    # 1. PREPARAÇÃO E NORMALIZAÇÃO
+    # Transformar o dicionário aninhado em uma lista plana para o Pandas
+    data_rows = []
+    
+    # Normaliza chaves para garantir unicidade e evitar o bug de linhas duplicadas.
+    # Criamos um novo dicionário onde removemos a barra final '/' de todas as pastas.
+    normalized_stats = defaultdict(lambda: defaultdict(int))
+    
+    for raw_folder, years in folder_stats.items():
+        clean_folder = raw_folder.rstrip('/') # Remove barra final
+        if not clean_folder: clean_folder = "Raiz"
         
-        # CASO 2: Pasta apenas estrutural (subpastas)
-        elif folder in all_known_paths and search_key not in files_found_paths:
-            rows.append({
-                "Pasta": search_key,
-                "Status da Pasta": "Apenas Subpastas",
-                "Ano": "-",
-                "Quantidade de Arquivos": 0
-            })
-        
-        # CASO 3: Pasta Vazia
-        else:
-            rows.append({
-                "Pasta": search_key,
-                "Status da Pasta": "Vazia",
-                "Ano": "-",
-                "Quantidade de Arquivos": 0
+        # Agrupa os dados na chave limpa
+        for year, count in years.items():
+            normalized_stats[clean_folder][year] += count
+
+    # Prepara a lista de dados apenas para pastas que TÊM arquivos
+    for folder, years_data in normalized_stats.items():
+        for year, count in years_data.items():
+            data_rows.append({
+                'Pasta': folder,
+                'Ano': year,
+                'Arquivos': count
             })
 
-    # 2. CRIAÇÃO DOS DATAFRAMES (Tabelas do Pandas)
-    df_detalhes = pd.DataFrame(rows)
-    
-    # Cria uma tabela de resumo com metadados da execução
-    df_resumo = pd.DataFrame([
-        {"Item": "Status da Execução", "Valor": status_msg},
-        {"Item": "Data do Relatório", "Valor": datetime.now().strftime('%d/%m/%Y %H:%M:%S')},
-        {"Item": "Bucket Analisado", "Valor": BUCKET_NAME},
-        {"Item": "Filtro Aplicado (Prefix)", "Valor": TARGET_FOLDER if TARGET_FOLDER else "(Raiz Total)"},
-        {"Item": "Trava de Segurança", "Valor": f"Ativa ({MAX_REQUESTS_SAFETY})" if MAX_REQUESTS_SAFETY > 0 else "Desativada"},
-        {"Item": "Total de Pastas Listadas", "Valor": len(sorted_folders)}
-    ])
+    # 2. CRIAÇÃO DA MATRIZ (PIVOT TABLE)
+    df = pd.DataFrame(data_rows)
 
-    # 3. GRAVAÇÃO DO ARQUIVO EXCEL
-    # Usamos o ExcelWriter para poder salvar múltiplas abas no mesmo arquivo
+    if not df.empty:
+        # A MÁGICA: Pivot Table transforma linhas (anos) em colunas.
+        # fill_value=0 garante que se a pasta não tem arquivo em 2020, aparece 0.
+        df_matrix = df.pivot_table(index='Pasta', columns='Ano', values='Arquivos', fill_value=0)
+        
+        # Adiciona coluna de Total Geral por pasta (soma horizontal)
+        df_matrix['Total Geral'] = df_matrix.sum(axis=1)
+        
+        # Ordena alfabeticamente pelo nome da pasta
+        df_matrix = df_matrix.sort_index()
+    else:
+        # Se não achou nada, cria tabela vazia
+        df_matrix = pd.DataFrame(columns=["Pasta", "Total Geral"])
+
+    # 3. TRATAMENTO DE PASTAS VAZIAS (ESTRUTURAIS)
+    # Identifica pastas que existem na estrutura (all_known_paths) mas não tiveram arquivos (normalized_stats)
+    all_clean_paths = {p.rstrip('/') for p in all_known_paths if p.rstrip('/')}
+    stats_clean_paths = set(normalized_stats.keys())
+    
+    # Subtração de conjuntos: Tudo que existe menos o que tem arquivo = Pastas Vazias
+    empty_folders = sorted(list(all_clean_paths - stats_clean_paths))
+    
+    # Cria um DataFrame separado só para as vazias para não poluir a matriz principal
+    if empty_folders:
+        df_empty = pd.DataFrame({'Pasta': empty_folders})
+        df_empty['Status'] = 'Vazia ou Apenas Subpastas'
+    else:
+        df_empty = pd.DataFrame()
+
+    # 4. SALVAMENTO NO EXCEL
     try:
         with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
+            
+            # Aba 1: A Matriz Principal (O que você quer ver organizado)
+            df_matrix.to_excel(writer, sheet_name='Matriz de Arquivos')
+            
+            # Aba 2: Pastas Vazias (Para auditoria, caso precise saber quais pastas não tem nada)
+            if not df_empty.empty:
+                df_empty.to_excel(writer, sheet_name='Pastas Vazias', index=False)
+            
+            # Aba 3: Resumo Técnico (Metadados da execução)
+            df_resumo = pd.DataFrame([
+                {"Item": "Status", "Valor": status_msg},
+                {"Item": "Data", "Valor": datetime.now().strftime('%d/%m/%Y %H:%M:%S')},
+                {"Item": "Total de Arquivos Listados", "Valor": df_matrix['Total Geral'].sum() if not df_matrix.empty else 0},
+                {"Item": "Bucket", "Valor": BUCKET_NAME}
+            ])
             df_resumo.to_excel(writer, sheet_name='Resumo', index=False)
-            df_detalhes.to_excel(writer, sheet_name='Dados Detalhados', index=False)
-        print("✅ Relatório Excel salvo com sucesso!")
+            
+        print("✅ Relatório Matriz salvo com sucesso!")
+        
     except Exception as e:
         print(f"❌ Erro ao salvar Excel: {e}")
-        print("Verifique se o arquivo não está aberto em outro programa.")
+        print("Verifique se o arquivo não está aberto.")
 
     # LIMPEZA: Se o script terminou com SUCESSO total, deletamos os checkpoints
     if "Sucesso" in status_msg:
@@ -224,8 +243,6 @@ def scan_bucket(bucket_name, prefix_folder):
         print(f"⚠️  MODO SEGURO ATIVO: Limite de {MAX_REQUESTS_SAFETY} requisições.")
 
     # Configuração da Paginação
-    # Se tivermos um start_token (do checkpoint), passamos ele para a AWS.
-    # A AWS vai pular tudo que já foi lido anteriormente.
     pagination_config = {'PageSize': 1000}
     if start_token:
         pagination_config['StartingToken'] = start_token
@@ -241,7 +258,6 @@ def scan_bucket(bucket_name, prefix_folder):
     pages_since_checkpoint = 0
 
     # --- BLOCO TRY/EXCEPT PRINCIPAL ---
-    # Protege a execução. Qualquer erro aqui dentro aciona o salvamento de emergência.
     try:
         # Usamos o 'with tqdm...' para ter controle manual da barra (atualizar texto ao lado)
         with tqdm(page_iterator, desc="Lendo AWS") as pbar:
@@ -251,8 +267,6 @@ def scan_bucket(bucket_name, prefix_folder):
                 pages_since_checkpoint += 1
                 
                 # --- AUTO-SAVE (CHECKPOINT) ---
-                # A cada 500 páginas (500k arquivos), salvamos o progresso.
-                # Isso garante que se der erro, perdemos no máximo os últimos minutos.
                 if 'NextContinuationToken' in page and pages_since_checkpoint >= 500:
                     save_checkpoint(folder_stats, all_known_paths, files_found_paths, page['NextContinuationToken'], total_files)
                     pages_since_checkpoint = 0 # Reseta contador
@@ -260,7 +274,6 @@ def scan_bucket(bucket_name, prefix_folder):
                 # --- TRAVA DE SEGURANÇA ---
                 if MAX_REQUESTS_SAFETY > 0 and requests_made > MAX_REQUESTS_SAFETY:
                     status_final = f"Interrompido (Limite: {MAX_REQUESTS_SAFETY})"
-                    # Quebra o loop for
                     break 
 
                 if 'Contents' not in page:
@@ -292,35 +305,27 @@ def scan_bucket(bucket_name, prefix_folder):
                     total_files += 1
                 
                 # --- ATUALIZAÇÃO VISUAL ---
-                # Atualiza o texto ao lado da barra com o número real de arquivos
                 pbar.set_postfix({'Arquivos': total_files})
 
-                # Guarda o token atual para caso precisemos salvar no 'Except' ou 'Break'
                 current_next_token = page.get('NextContinuationToken', None)
                 
-                # Se quebrou por segurança acima, precisamos sair do loop do tqdm também
                 if MAX_REQUESTS_SAFETY > 0 and requests_made > MAX_REQUESTS_SAFETY:
                     break
 
     except KeyboardInterrupt:
-        # Captura o Ctrl+C do usuário
         print("\n\n⚠️  USUÁRIO INTERROMPEU (Ctrl+C). Salvando estado...")
         status_final = "Cancelado pelo Usuário"
-        # Salva o checkpoint imediatamente com o último token conhecido
         if 'current_next_token' in locals() and current_next_token:
             save_checkpoint(folder_stats, all_known_paths, files_found_paths, current_next_token, total_files)
     
     except Exception as e:
-        # Captura erros de internet, memória, etc.
         print(f"\n\n❌ ERRO INESPERADO: {e}")
         status_final = f"Erro Crítico: {str(e)}"
         if 'current_next_token' in locals() and current_next_token:
             save_checkpoint(folder_stats, all_known_paths, files_found_paths, current_next_token, total_files)
 
     finally:
-        # Este bloco SEMPRE roda no final, dando erro ou sucesso.
         print(f"\nProcesso finalizado. Total acumulado: {total_files} arquivos.")
-        # Chamamos a nova função de Excel aqui
         generate_excel_report(folder_stats, all_known_paths, files_found_paths, status_msg=status_final)
 
 if __name__ == "__main__":
