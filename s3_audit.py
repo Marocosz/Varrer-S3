@@ -4,7 +4,6 @@ import boto3
 import os
 import pickle
 from collections import defaultdict
-# Importamos timezone e timedelta para calcular "3 meses atrás" corretamente
 from datetime import datetime, timedelta, timezone 
 from tqdm import tqdm
 from dotenv import load_dotenv
@@ -97,16 +96,18 @@ def get_immediate_subfolders(s3_client, bucket, prefix):
     folders.sort()
     return folders
 
-def save_checkpoint(folder_stats, recent_files_stats, all_known_paths, files_found_paths, next_token, total_files, current_folder_idx):
+def save_checkpoint(folder_stats, recent_files_stats, mp4_stats, mkv_stats, all_known_paths, files_found_paths, next_token, total_files, current_folder_idx):
     """
     Salva o estado atual.
-    ATUALIZADO: Agora salva também 'recent_files_stats' (arquivos recentes).
+    ATUALIZADO: Agora salva também 'mp4_stats' e 'mkv_stats'.
     """
     logging.info(f"Salvando Checkpoint... (Total: {total_files}, Pasta Index: {current_folder_idx})")
     
     data_to_save = {
         'stats': folder_stats,
-        'recent_stats': recent_files_stats, # Novo campo salvo
+        'recent_stats': recent_files_stats,
+        'mp4_stats': mp4_stats,  # Novo campo
+        'mkv_stats': mkv_stats,  # Novo campo
         'all_paths': all_known_paths,
         'file_paths': files_found_paths,
         'total': total_files,
@@ -129,7 +130,7 @@ def save_checkpoint(folder_stats, recent_files_stats, all_known_paths, files_fou
 def load_checkpoint():
     """
     Carrega o estado anterior.
-    ATUALIZADO: Recupera também 'recent_files_stats'.
+    ATUALIZADO: Recupera também 'mp4_stats' e 'mkv_stats'.
     """
     if os.path.exists(CHECKPOINT_STATS_FILE):
         print("\n🔄 CHECKPOINT ENCONTRADO! Carregando estado anterior...")
@@ -145,13 +146,15 @@ def load_checkpoint():
             
             idx = data.get('folder_idx', 0)
             
-            # Recupera os dados recentes, se existirem (compatibilidade com checkpoints antigos)
+            # Recupera os dados, com fallback para dicionários vazios para compatibilidade
             recent_stats = data.get('recent_stats', defaultdict(int))
+            mp4_stats = data.get('mp4_stats', defaultdict(int)) # Novo
+            mkv_stats = data.get('mkv_stats', defaultdict(int)) # Novo
             
             print(f"   -> Retomando da pasta nº {idx+1}, Arquivos processados: {data['total']}")
             logging.info(f"Retomando varredura. Pasta Index: {idx}, Arquivos: {data['total']}")
             
-            return data['stats'], recent_stats, data['all_paths'], data['file_paths'], data['total'], token, idx
+            return data['stats'], recent_stats, mp4_stats, mkv_stats, data['all_paths'], data['file_paths'], data['total'], token, idx
         
         except Exception as e:
             msg = f"Erro ao ler checkpoint ({e}). Iniciando do zero."
@@ -159,12 +162,12 @@ def load_checkpoint():
             logging.warning(msg)
     
     # Retorna None se não houver checkpoint
-    return None, None, None, None, 0, None, 0
+    return None, None, None, None, None, None, 0, None, 0
 
-def generate_excel_report(folder_stats, recent_files_stats, all_known_paths, files_found_paths, status_msg="Concluído com Sucesso"):
+def generate_excel_report(folder_stats, recent_files_stats, mp4_stats, mkv_stats, all_known_paths, files_found_paths, status_msg="Concluído com Sucesso"):
     """
     Gera o relatório em formato de MATRIZ.
-    ATUALIZADO: Adiciona a coluna de 'Arquivos Recentes (90 dias)'.
+    ATUALIZADO: Adiciona colunas para MP4 e MKV.
     """
     print(f"\n💾 Compilando dados para Excel...")
     logging.info("Iniciando compilação e geração dos arquivos Excel...")
@@ -193,26 +196,33 @@ def generate_excel_report(folder_stats, recent_files_stats, all_known_paths, fil
     else:
         df_matrix = pd.DataFrame(columns=["Pasta", "Total Geral"])
 
-    # --- NOVA LÓGICA: ADICIONAR COLUNA DE RECENTES ---
-    # Normaliza os dados recentes (remove barra final)
-    normalized_recent = defaultdict(int)
-    for r_folder, r_count in recent_files_stats.items():
-        clean_r = r_folder.rstrip('/')
-        if not clean_r: clean_r = "Raiz"
-        normalized_recent[clean_r] += r_count
+    # --- NOVA LÓGICA: ADICIONAR COLUNAS EXTRAS ---
     
-    # Mapeia os valores para o DataFrame principal usando o índice (Nome da Pasta)
-    # Se a pasta não tiver arquivos recentes, preenche com 0
-    df_matrix['Recentes (90 dias)'] = df_matrix.index.map(normalized_recent).fillna(0).astype(int)
+    # Função auxiliar para normalizar e mapear dados extras
+    def map_extra_column(stats_dict, col_name):
+        norm_dict = defaultdict(int)
+        for folder, count in stats_dict.items():
+            clean = folder.rstrip('/')
+            if not clean: clean = "Raiz"
+            norm_dict[clean] += count
+        df_matrix[col_name] = df_matrix.index.map(norm_dict).fillna(0).astype(int)
+
+    # Mapeia Recentes
+    map_extra_column(recent_files_stats, 'Recentes (90 dias)')
     
-    # Reordena as colunas para que 'Total Geral' e 'Recentes' fiquem no final
-    cols = [c for c in df_matrix.columns if c not in ['Total Geral', 'Recentes (90 dias)']]
-    cols.sort() # Ordena os anos
-    cols.append('Total Geral')
-    cols.append('Recentes (90 dias)')
+    # Mapeia MP4
+    map_extra_column(mp4_stats, 'Qtd .mp4')
+    
+    # Mapeia MKV
+    map_extra_column(mkv_stats, 'Qtd .mkv')
+    
+    # Reordena colunas
+    cols = [c for c in df_matrix.columns if c not in ['Total Geral', 'Recentes (90 dias)', 'Qtd .mp4', 'Qtd .mkv']]
+    cols.sort()
+    # Adiciona as colunas especiais no final
+    cols.extend(['Total Geral', 'Recentes (90 dias)', 'Qtd .mp4', 'Qtd .mkv'])
+    
     df_matrix = df_matrix[cols]
-    
-    # Ordena as linhas (pastas)
     df_matrix = df_matrix.sort_index()
     # -------------------------------------------------
 
@@ -231,6 +241,8 @@ def generate_excel_report(folder_stats, recent_files_stats, all_known_paths, fil
         {"Item": "Data do Relatório", "Valor": datetime.now().strftime('%d/%m/%Y %H:%M:%S')},
         {"Item": "Total Arquivos", "Valor": df_matrix['Total Geral'].sum() if not df_matrix.empty else 0},
         {"Item": "Arquivos Recentes (90d)", "Valor": df_matrix['Recentes (90 dias)'].sum() if not df_matrix.empty else 0},
+        {"Item": "Total .mp4", "Valor": df_matrix['Qtd .mp4'].sum() if not df_matrix.empty else 0},
+        {"Item": "Total .mkv", "Valor": df_matrix['Qtd .mkv'].sum() if not df_matrix.empty else 0},
         {"Item": "Bucket", "Valor": BUCKET_NAME},
         {"Item": "Pasta Ignorada", "Valor": IGNORED_PREFIX}
     ])
@@ -278,7 +290,7 @@ def scan_bucket(bucket_name, root_prefix):
 
     s3 = get_s3_client()
     
-    # Data de Corte (3 meses = 90 dias) com Fuso Horário UTC (Padrão S3)
+    # Data de Corte
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=90)
     print(f"📅 Data de corte para arquivos recentes: {cutoff_date.strftime('%d/%m/%Y')}")
     
@@ -314,19 +326,23 @@ def scan_bucket(bucket_name, root_prefix):
     logging.info(f"Lista de ataque finalizada. Total: {len(folders_to_scan)}")
 
     # --- PASSO 2: Preparar Variáveis / Checkpoint ---
-    # Carrega agora também o dicionário de arquivos recentes (recent_files_stats)
-    stats, recent_stats, paths, files_paths, total_start, start_token, start_folder_idx = load_checkpoint()
+    # Carrega dicionários antigos e novos
+    stats, recent_stats, mp4_data, mkv_data, paths, files_paths, total_start, start_token, start_folder_idx = load_checkpoint()
     
     if stats:
         folder_stats = stats
-        recent_files_stats = recent_stats # Carrega do checkpoint
+        recent_files_stats = recent_stats
+        mp4_stats = mp4_data # Carrega MP4
+        mkv_stats = mkv_data # Carrega MKV
         all_known_paths = paths
         files_found_paths = files_paths
         total_files = total_start
         current_folder_idx = start_folder_idx
     else:
         folder_stats = defaultdict(create_nested_defaultdict)
-        recent_files_stats = defaultdict(int) # Inicializa zerado
+        recent_files_stats = defaultdict(int)
+        mp4_stats = defaultdict(int) # Inicializa zerado
+        mkv_stats = defaultdict(int) # Inicializa zerado
         all_known_paths = set()
         files_found_paths = set()
         total_files = 0
@@ -366,7 +382,7 @@ def scan_bucket(bucket_name, root_prefix):
                     pages_since_save += 1
                     
                     if 'NextContinuationToken' in page and pages_since_save >= 500:
-                        save_checkpoint(folder_stats, recent_files_stats, all_known_paths, files_found_paths, page['NextContinuationToken'], total_files, i)
+                        save_checkpoint(folder_stats, recent_files_stats, mp4_stats, mkv_stats, all_known_paths, files_found_paths, page['NextContinuationToken'], total_files, i)
                         pages_since_save = 0
 
                     if MAX_REQUESTS_SAFETY > 0 and requests_made > MAX_REQUESTS_SAFETY:
@@ -393,7 +409,6 @@ def scan_bucket(bucket_name, root_prefix):
                             if not folder_path: folder_path = "Raiz"
                             files_found_paths.add(folder_path)
                             
-                            # Hierarquia
                             parts = folder_path.split('/')
                             current_build = ""
                             for part in parts:
@@ -401,15 +416,22 @@ def scan_bucket(bucket_name, root_prefix):
                                 current_build = f"{current_build}{part}/" if current_build else f"{part}/"
                                 all_known_paths.add(current_build)
 
-                            # Estatística Principal (Ano)
+                            # --- ESTATÍSTICAS ---
+                            # 1. Ano
                             year = last_modified.year
                             folder_stats[folder_path][year] += 1
                             
-                            # --- ESTATÍSTICA NOVA: ARQUIVOS RECENTES ---
-                            # Verifica se o arquivo é mais novo que a data de corte (90 dias)
+                            # 2. Recentes
                             if last_modified >= cutoff_date:
                                 recent_files_stats[folder_path] += 1
-                            # -------------------------------------------
+                            
+                            # 3. Tipos de Arquivo (Case Insensitive)
+                            lower_key = key.lower()
+                            if lower_key.endswith('.mp4'):
+                                mp4_stats[folder_path] += 1
+                            elif lower_key.endswith('.mkv'):
+                                mkv_stats[folder_path] += 1
+                            # -------------------
 
                             total_files += 1
 
@@ -421,28 +443,28 @@ def scan_bucket(bucket_name, root_prefix):
                     pbar.set_postfix({'Total': total_files})
                     current_next_token = page.get('NextContinuationToken', None)
 
-            save_checkpoint(folder_stats, recent_files_stats, all_known_paths, files_found_paths, None, total_files, i + 1)
+            save_checkpoint(folder_stats, recent_files_stats, mp4_stats, mkv_stats, all_known_paths, files_found_paths, None, total_files, i + 1)
 
     except (KeyboardInterrupt, StopIteration):
         print("\n⚠️ Parada solicitada.")
         if status_final == "Concluído com Sucesso": status_final = "Cancelado pelo Usuário"
         
         if 'current_next_token' in locals() and current_next_token:
-            save_checkpoint(folder_stats, recent_files_stats, all_known_paths, files_found_paths, current_next_token, total_files, i)
+            save_checkpoint(folder_stats, recent_files_stats, mp4_stats, mkv_stats, all_known_paths, files_found_paths, current_next_token, total_files, i)
         else:
-            save_checkpoint(folder_stats, recent_files_stats, all_known_paths, files_found_paths, None, total_files, i)
+            save_checkpoint(folder_stats, recent_files_stats, mp4_stats, mkv_stats, all_known_paths, files_found_paths, None, total_files, i)
 
     except Exception as e:
         print(f"\n❌ ERRO CRÍTICO: {e}")
         logging.critical(f"Erro fatal: {e}", exc_info=True)
         status_final = f"Erro: {str(e)}"
         if 'current_next_token' in locals() and current_next_token:
-             save_checkpoint(folder_stats, recent_files_stats, all_known_paths, files_found_paths, current_next_token, total_files, i)
+             save_checkpoint(folder_stats, recent_files_stats, mp4_stats, mkv_stats, all_known_paths, files_found_paths, current_next_token, total_files, i)
 
     finally:
         print(f"\nFinalizado. Total acumulado: {total_files}")
         logging.info(f"Fim. Total: {total_files}. Ignorados/Erros: {ignored_files_count}")
-        generate_excel_report(folder_stats, recent_files_stats, all_known_paths, files_found_paths, status_msg=status_final)
+        generate_excel_report(folder_stats, recent_files_stats, mp4_stats, mkv_stats, all_known_paths, files_found_paths, status_msg=status_final)
 
 if __name__ == "__main__":
     scan_bucket(BUCKET_NAME, TARGET_FOLDER)
