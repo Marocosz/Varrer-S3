@@ -96,18 +96,17 @@ def get_immediate_subfolders(s3_client, bucket, prefix):
     folders.sort()
     return folders
 
-def save_checkpoint(folder_stats, recent_files_stats, mp4_stats, mkv_stats, all_known_paths, files_found_paths, next_token, total_files, current_folder_idx):
+def save_checkpoint(folder_stats, recent_files_stats, extension_stats, all_known_paths, files_found_paths, next_token, total_files, current_folder_idx):
     """
     Salva o estado atual.
-    ATUALIZADO: Agora salva também 'mp4_stats' e 'mkv_stats'.
+    ATUALIZADO: Agora salva 'extension_stats' (dicionário genérico de extensões).
     """
     logging.info(f"Salvando Checkpoint... (Total: {total_files}, Pasta Index: {current_folder_idx})")
     
     data_to_save = {
         'stats': folder_stats,
         'recent_stats': recent_files_stats,
-        'mp4_stats': mp4_stats,  # Novo campo
-        'mkv_stats': mkv_stats,  # Novo campo
+        'ext_stats': extension_stats, # Novo campo genérico para todas extensões
         'all_paths': all_known_paths,
         'file_paths': files_found_paths,
         'total': total_files,
@@ -130,7 +129,7 @@ def save_checkpoint(folder_stats, recent_files_stats, mp4_stats, mkv_stats, all_
 def load_checkpoint():
     """
     Carrega o estado anterior.
-    ATUALIZADO: Recupera também 'mp4_stats' e 'mkv_stats'.
+    ATUALIZADO: Recupera 'extension_stats'.
     """
     if os.path.exists(CHECKPOINT_STATS_FILE):
         print("\n🔄 CHECKPOINT ENCONTRADO! Carregando estado anterior...")
@@ -146,15 +145,17 @@ def load_checkpoint():
             
             idx = data.get('folder_idx', 0)
             
-            # Recupera os dados, com fallback para dicionários vazios para compatibilidade
+            # Recupera os dados
             recent_stats = data.get('recent_stats', defaultdict(int))
-            mp4_stats = data.get('mp4_stats', defaultdict(int)) # Novo
-            mkv_stats = data.get('mkv_stats', defaultdict(int)) # Novo
+            
+            # Tenta recuperar ext_stats (novo), se não existir (checkpoint antigo), inicia vazio
+            # Se vier de um checkpoint que tinha mp4/mkv hardcoded, eles serão ignorados em prol da nova lógica
+            extension_stats = data.get('ext_stats', defaultdict(create_nested_defaultdict))
             
             print(f"   -> Retomando da pasta nº {idx+1}, Arquivos processados: {data['total']}")
             logging.info(f"Retomando varredura. Pasta Index: {idx}, Arquivos: {data['total']}")
             
-            return data['stats'], recent_stats, mp4_stats, mkv_stats, data['all_paths'], data['file_paths'], data['total'], token, idx
+            return data['stats'], recent_stats, extension_stats, data['all_paths'], data['file_paths'], data['total'], token, idx
         
         except Exception as e:
             msg = f"Erro ao ler checkpoint ({e}). Iniciando do zero."
@@ -162,12 +163,12 @@ def load_checkpoint():
             logging.warning(msg)
     
     # Retorna None se não houver checkpoint
-    return None, None, None, None, None, None, 0, None, 0
+    return None, None, None, None, None, 0, None, 0
 
-def generate_excel_report(folder_stats, recent_files_stats, mp4_stats, mkv_stats, all_known_paths, files_found_paths, status_msg="Concluído com Sucesso"):
+def generate_excel_report(folder_stats, recent_files_stats, extension_stats, all_known_paths, files_found_paths, status_msg="Concluído com Sucesso"):
     """
     Gera o relatório em formato de MATRIZ.
-    ATUALIZADO: Adiciona colunas para MP4 e MKV.
+    ATUALIZADO: Gera colunas dinâmicas para TODAS as extensões encontradas.
     """
     print(f"\n💾 Compilando dados para Excel...")
     logging.info("Iniciando compilação e geração dos arquivos Excel...")
@@ -186,47 +187,76 @@ def generate_excel_report(folder_stats, recent_files_stats, mp4_stats, mkv_stats
         for year, count in years_data.items():
             data_rows.append({'Pasta': folder, 'Ano': year, 'Arquivos': count})
 
-    # 2. CRIAÇÃO DA MATRIZ
+    # 2. CRIAÇÃO DA MATRIZ PRINCIPAL (ANOS)
     df = pd.DataFrame(data_rows)
-    df_matrix = pd.DataFrame()
-
+    
     if not df.empty:
         df_matrix = df.pivot_table(index='Pasta', columns='Ano', values='Arquivos', fill_value=0)
         df_matrix['Total Geral'] = df_matrix.sum(axis=1)
     else:
         df_matrix = pd.DataFrame(columns=["Pasta", "Total Geral"])
 
-    # --- NOVA LÓGICA: ADICIONAR COLUNAS EXTRAS ---
+    # 3. COLUNA DE RECENTES
+    normalized_recent = defaultdict(int)
+    for r_folder, r_count in recent_files_stats.items():
+        clean_r = r_folder.rstrip('/')
+        if not clean_r: clean_r = "Raiz"
+        normalized_recent[clean_r] += r_count
     
-    # Função auxiliar para normalizar e mapear dados extras
-    def map_extra_column(stats_dict, col_name):
-        norm_dict = defaultdict(int)
-        for folder, count in stats_dict.items():
-            clean = folder.rstrip('/')
-            if not clean: clean = "Raiz"
-            norm_dict[clean] += count
-        df_matrix[col_name] = df_matrix.index.map(norm_dict).fillna(0).astype(int)
+    df_matrix['Recentes (90 dias)'] = df_matrix.index.map(normalized_recent).fillna(0).astype(int)
 
-    # Mapeia Recentes
-    map_extra_column(recent_files_stats, 'Recentes (90 dias)')
+    # 4. COLUNAS DINÂMICAS DE EXTENSÕES
+    # Transforma o dicionário extension_stats em um DataFrame e depois faz Pivot
+    ext_rows = []
     
-    # Mapeia MP4
-    map_extra_column(mp4_stats, 'Qtd .mp4')
+    # Normaliza as chaves das extensões
+    normalized_exts = defaultdict(create_nested_defaultdict)
+    for raw_folder, exts in extension_stats.items():
+        clean_folder = raw_folder.rstrip('/')
+        if not clean_folder: clean_folder = "Raiz"
+        for ext, count in exts.items():
+            normalized_exts[clean_folder][ext] += count
+
+    for folder, ext_data in normalized_exts.items():
+        for ext, count in ext_data.items():
+            ext_rows.append({'Pasta': folder, 'Ext': ext, 'Qtd': count})
     
-    # Mapeia MKV
-    map_extra_column(mkv_stats, 'Qtd .mkv')
+    if ext_rows:
+        df_ext = pd.DataFrame(ext_rows)
+        # Cria matriz de extensões: Linha=Pasta, Coluna=Extensão, Valor=Qtd
+        df_ext_pivot = df_ext.pivot_table(index='Pasta', columns='Ext', values='Qtd', fill_value=0)
+        
+        # Junta a matriz de Anos com a matriz de Extensões
+        # O join é feito pelo Index (Nome da Pasta)
+        df_matrix = df_matrix.join(df_ext_pivot, how='outer').fillna(0)
+        
+        # Converte tudo para inteiro para ficar bonito no Excel
+        # (O join pode introduzir floats devido aos NaNs)
+        df_matrix = df_matrix.astype(int)
+
+    # REORDENAÇÃO FINAL DE COLUNAS
+    # Queremos: [Anos...] -> [Total Geral] -> [Recentes] -> [Extensões A-Z...]
+    all_cols = list(df_matrix.columns)
     
-    # Reordena colunas
-    cols = [c for c in df_matrix.columns if c not in ['Total Geral', 'Recentes (90 dias)', 'Qtd .mp4', 'Qtd .mkv']]
-    cols.sort()
-    # Adiciona as colunas especiais no final
-    cols.extend(['Total Geral', 'Recentes (90 dias)', 'Qtd .mp4', 'Qtd .mkv'])
+    # Identifica colunas de anos (são números)
+    year_cols = [c for c in all_cols if isinstance(c, int) or (isinstance(c, str) and c.isdigit())]
+    year_cols.sort()
     
-    df_matrix = df_matrix[cols]
+    # Identifica colunas fixas
+    fixed_cols = ['Total Geral', 'Recentes (90 dias)']
+    
+    # Identifica colunas de extensão (tudo que sobrar)
+    ext_cols = [c for c in all_cols if c not in year_cols and c not in fixed_cols]
+    ext_cols.sort() # Ordena alfabeticamente (.avi, .mkv, .mp4, .txt...)
+    
+    final_order = year_cols + fixed_cols + ext_cols
+    # Reconstrói apenas com as colunas que realmente existem
+    final_order = [c for c in final_order if c in df_matrix.columns]
+    
+    df_matrix = df_matrix[final_order]
     df_matrix = df_matrix.sort_index()
-    # -------------------------------------------------
 
-    # 3. TRATAMENTO DE PASTAS VAZIAS
+    # 5. TRATAMENTO DE PASTAS VAZIAS
     all_clean_paths = {p.rstrip('/') for p in all_known_paths if p.rstrip('/')}
     stats_clean_paths = set(normalized_stats.keys())
     empty_folders = sorted(list(all_clean_paths - stats_clean_paths))
@@ -240,14 +270,12 @@ def generate_excel_report(folder_stats, recent_files_stats, mp4_stats, mkv_stats
         {"Item": "Status da Execução", "Valor": status_msg},
         {"Item": "Data do Relatório", "Valor": datetime.now().strftime('%d/%m/%Y %H:%M:%S')},
         {"Item": "Total Arquivos", "Valor": df_matrix['Total Geral'].sum() if not df_matrix.empty else 0},
-        {"Item": "Arquivos Recentes (90d)", "Valor": df_matrix['Recentes (90 dias)'].sum() if not df_matrix.empty else 0},
-        {"Item": "Total .mp4", "Valor": df_matrix['Qtd .mp4'].sum() if not df_matrix.empty else 0},
-        {"Item": "Total .mkv", "Valor": df_matrix['Qtd .mkv'].sum() if not df_matrix.empty else 0},
+        {"Item": "Arquivos Recentes (90d)", "Valor": df_matrix['Recentes (90 dias)'].sum() if 'Recentes (90 dias)' in df_matrix else 0},
         {"Item": "Bucket", "Valor": BUCKET_NAME},
         {"Item": "Pasta Ignorada", "Valor": IGNORED_PREFIX}
     ])
 
-    # 4. SALVAMENTO COM DIVISÃO (SPLIT)
+    # 6. SALVAMENTO COM DIVISÃO (SPLIT)
     total_rows = len(df_matrix)
     num_files = math.ceil(total_rows / ROWS_PER_FILE) if total_rows > 0 else 1
 
@@ -327,13 +355,12 @@ def scan_bucket(bucket_name, root_prefix):
 
     # --- PASSO 2: Preparar Variáveis / Checkpoint ---
     # Carrega dicionários antigos e novos
-    stats, recent_stats, mp4_data, mkv_data, paths, files_paths, total_start, start_token, start_folder_idx = load_checkpoint()
+    stats, recent_stats, ext_stats, paths, files_paths, total_start, start_token, start_folder_idx = load_checkpoint()
     
     if stats:
         folder_stats = stats
         recent_files_stats = recent_stats
-        mp4_stats = mp4_data # Carrega MP4
-        mkv_stats = mkv_data # Carrega MKV
+        extension_stats = ext_stats # Carrega as estatísticas de extensões
         all_known_paths = paths
         files_found_paths = files_paths
         total_files = total_start
@@ -341,8 +368,7 @@ def scan_bucket(bucket_name, root_prefix):
     else:
         folder_stats = defaultdict(create_nested_defaultdict)
         recent_files_stats = defaultdict(int)
-        mp4_stats = defaultdict(int) # Inicializa zerado
-        mkv_stats = defaultdict(int) # Inicializa zerado
+        extension_stats = defaultdict(create_nested_defaultdict) # Inicializa dicionário de extensões
         all_known_paths = set()
         files_found_paths = set()
         total_files = 0
@@ -382,7 +408,7 @@ def scan_bucket(bucket_name, root_prefix):
                     pages_since_save += 1
                     
                     if 'NextContinuationToken' in page and pages_since_save >= 500:
-                        save_checkpoint(folder_stats, recent_files_stats, mp4_stats, mkv_stats, all_known_paths, files_found_paths, page['NextContinuationToken'], total_files, i)
+                        save_checkpoint(folder_stats, recent_files_stats, extension_stats, all_known_paths, files_found_paths, page['NextContinuationToken'], total_files, i)
                         pages_since_save = 0
 
                     if MAX_REQUESTS_SAFETY > 0 and requests_made > MAX_REQUESTS_SAFETY:
@@ -425,12 +451,14 @@ def scan_bucket(bucket_name, root_prefix):
                             if last_modified >= cutoff_date:
                                 recent_files_stats[folder_path] += 1
                             
-                            # 3. Tipos de Arquivo (Case Insensitive)
-                            lower_key = key.lower()
-                            if lower_key.endswith('.mp4'):
-                                mp4_stats[folder_path] += 1
-                            elif lower_key.endswith('.mkv'):
-                                mkv_stats[folder_path] += 1
+                            # 3. Tipos de Arquivo (GENÉRICO PARA TODOS)
+                            # Pega a extensão (ex: .mp4, .txt, .pdf)
+                            _, ext = os.path.splitext(key)
+                            if ext:
+                                ext = ext.lower() # Padroniza para minúsculo
+                                extension_stats[folder_path][ext] += 1
+                            else:
+                                extension_stats[folder_path]['(sem extensão)'] += 1
                             # -------------------
 
                             total_files += 1
@@ -443,28 +471,28 @@ def scan_bucket(bucket_name, root_prefix):
                     pbar.set_postfix({'Total': total_files})
                     current_next_token = page.get('NextContinuationToken', None)
 
-            save_checkpoint(folder_stats, recent_files_stats, mp4_stats, mkv_stats, all_known_paths, files_found_paths, None, total_files, i + 1)
+            save_checkpoint(folder_stats, recent_files_stats, extension_stats, all_known_paths, files_found_paths, None, total_files, i + 1)
 
     except (KeyboardInterrupt, StopIteration):
         print("\n⚠️ Parada solicitada.")
         if status_final == "Concluído com Sucesso": status_final = "Cancelado pelo Usuário"
         
         if 'current_next_token' in locals() and current_next_token:
-            save_checkpoint(folder_stats, recent_files_stats, mp4_stats, mkv_stats, all_known_paths, files_found_paths, current_next_token, total_files, i)
+            save_checkpoint(folder_stats, recent_files_stats, extension_stats, all_known_paths, files_found_paths, current_next_token, total_files, i)
         else:
-            save_checkpoint(folder_stats, recent_files_stats, mp4_stats, mkv_stats, all_known_paths, files_found_paths, None, total_files, i)
+            save_checkpoint(folder_stats, recent_files_stats, extension_stats, all_known_paths, files_found_paths, None, total_files, i)
 
     except Exception as e:
         print(f"\n❌ ERRO CRÍTICO: {e}")
         logging.critical(f"Erro fatal: {e}", exc_info=True)
         status_final = f"Erro: {str(e)}"
         if 'current_next_token' in locals() and current_next_token:
-             save_checkpoint(folder_stats, recent_files_stats, mp4_stats, mkv_stats, all_known_paths, files_found_paths, current_next_token, total_files, i)
+             save_checkpoint(folder_stats, recent_files_stats, extension_stats, all_known_paths, files_found_paths, current_next_token, total_files, i)
 
     finally:
         print(f"\nFinalizado. Total acumulado: {total_files}")
         logging.info(f"Fim. Total: {total_files}. Ignorados/Erros: {ignored_files_count}")
-        generate_excel_report(folder_stats, recent_files_stats, mp4_stats, mkv_stats, all_known_paths, files_found_paths, status_msg=status_final)
+        generate_excel_report(folder_stats, recent_files_stats, extension_stats, all_known_paths, files_found_paths, status_msg=status_final)
 
 if __name__ == "__main__":
     scan_bucket(BUCKET_NAME, TARGET_FOLDER)
