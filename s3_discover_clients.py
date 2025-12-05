@@ -217,17 +217,20 @@ def analyze_folder(s3, textract, folder):
                         try:
                             # Baixa o arquivo para a memória RAM (BytesIO)
                             file_stream = io.BytesIO()
+                            
+                            # CORREÇÃO: Removido o parâmetro Config=... que causava o erro.
+                            # Os timeouts já estão configurados na instância do cliente 's3'.
                             s3.download_fileobj(
                                 BUCKET_NAME,
                                 key,
-                                file_stream,
-                                Config=Config(connect_timeout=3, read_timeout=6, retries={"max_attempts": 0})
+                                file_stream
                             )
                             file_bytes = file_stream.getvalue()
 
                             # Validação de tamanho para a API Síncrona do Textract (Limite 5MB)
                             if len(file_bytes) > 5 * 1024 * 1024:
                                 logging.warning(f"Ignorado (Grande): {key}")
+                                print(f"      ⚠️ Arquivo muito grande (>5MB), pulando.")
                                 continue
 
                             # Processamento OCR
@@ -236,11 +239,17 @@ def analyze_folder(s3, textract, folder):
                                 try:
                                     resp = textract.detect_document_text(Document={'Bytes': file_bytes})
                                     full_text = "\n".join([b['Text'] for b in resp['Blocks'] if b['BlockType'] == 'LINE'])
+                                    
+                                    # DEBUG: Mostra se achou texto
+                                    if not full_text:
+                                        print("      ⚠️ OCR retornou texto vazio.")
+                                    
                                 except (EndpointConnectionError, ConnectTimeoutError):
                                     print("⚠️ Textract inacessível. OCR desativado para evitar travamentos.")
                                     textract_available = False # Desativa globalmente para esta execução
                                     continue
                                 except Exception as e:
+                                    print(f"      ❌ ERRO NO TEXTRACT: {e}")
                                     logging.error(f"Erro no Textract: {e}")
                                     continue
 
@@ -268,13 +277,14 @@ def analyze_folder(s3, textract, folder):
                             }
 
                             stats['files_data'].append(file_record)
-                            stats['ocr_performed'] += 1
+                            stats['ocr_performed'] += 1 # Incrementa apenas se der sucesso total
 
                         # Tratamento de erros de rede durante o processamento do arquivo individual
                         except (EndpointConnectionError, ConnectTimeoutError) as e:
                             print(f"      ❌ FALHA DE REDE (Download S3): {e}. Pulando...")
                             continue
                         except Exception as e:
+                            print(f"      ❌ ERRO GENÉRICO: {e}")
                             logging.error(f"Erro genérico no arquivo {key}: {e}")
                             continue
                             
