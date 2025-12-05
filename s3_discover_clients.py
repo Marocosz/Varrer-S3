@@ -7,7 +7,7 @@ import io
 import logging
 from dotenv import load_dotenv
 from tqdm import tqdm
-# --- NOVO: Imports para lidar com datas ---
+# --- Imports para lidar com datas ---
 from datetime import datetime, timedelta, timezone
 
 # ================= CONFIGURAÇÕES =================
@@ -82,7 +82,6 @@ def extract_info_from_text(text):
         upper_line = line.upper()
         
         # --- 1. Busca por Contexto ---
-        # Se a linha contiver "TOMADOR" ou "EMPRESA", salvamos ela inteira.
         if any(key in upper_line for key in KEYWORDS_CONTEXTO):
             # Limpa caracteres muito sujos do OCR para ficar legível no Excel
             clean_context = re.sub(r'\s+', ' ', line).strip()
@@ -123,7 +122,33 @@ def extract_info_from_text(text):
 # ================= FUNÇÕES AWS =================
 
 def get_aws_clients():
-    return boto3.client('s3'), boto3.client('textract')
+    """
+    Cria e retorna os clientes S3 e Textract com credenciais EXPLÍCITAS.
+    Isso corrige o erro 'NoRegionError'.
+    """
+    aws_access_key = os.getenv('AWS_ACCESS_KEY_ID')
+    aws_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+    aws_region = os.getenv('AWS_REGION')
+
+    if not aws_access_key or not aws_secret_key or not aws_region:
+        raise ValueError("ERRO: Credenciais AWS ou Região não encontradas no .env")
+
+    # Configuração explícita da sessão
+    s3_client = boto3.client(
+        's3',
+        aws_access_key_id=aws_access_key,
+        aws_secret_access_key=aws_secret_key,
+        region_name=aws_region
+    )
+    
+    textract_client = boto3.client(
+        'textract',
+        aws_access_key_id=aws_access_key,
+        aws_secret_access_key=aws_secret_key,
+        region_name=aws_region
+    )
+    
+    return s3_client, textract_client
 
 def analyze_folder(s3, textract, folder):
     """
@@ -141,7 +166,7 @@ def analyze_folder(s3, textract, folder):
         'files_data': [] # Lista com detalhes de cada arquivo lido
     }
 
-    # --- NOVO: DEFINIÇÃO DE DATA DE CORTE ---
+    # --- DEFINIÇÃO DE DATA DE CORTE ---
     # 90 dias atrás a partir de hoje (UTC, pois o S3 usa UTC)
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=90)
     print(f"   📅 Filtro de Data Ativo: Apenas arquivos posteriores a {cutoff_date.strftime('%d/%m/%Y')}")
@@ -159,7 +184,7 @@ def analyze_folder(s3, textract, folder):
                 
                 stats['total_files'] += 1
                 
-                # --- NOVO: FILTRO DE DATA ---
+                # --- FILTRO DE DATA ---
                 last_modified = obj['LastModified']
                 if last_modified < cutoff_date:
                     # Se for antigo, ignora silenciosamente e vai pro próximo
@@ -192,14 +217,28 @@ def analyze_folder(s3, textract, folder):
                             # 4. Extrair Dados
                             info = extract_info_from_text(full_text)
                             
+                            # --- VERIFICAÇÃO DE SUCESSO/FALHA ---
+                            # Verifica se encontrou ALGUMA coisa útil
+                            has_data = any([
+                                info['CNPJs'], 
+                                info['CPFs'], 
+                                info['Emails'], 
+                                info['Possiveis Empresas'], 
+                                info['Linhas de Contexto']
+                            ])
+                            
+                            status_identificacao = "SUCESSO" if has_data else "NENHUM DADO ENCONTRADO"
+                            # ------------------------------------
+
                             # 5. Salvar Dados do Arquivo
                             file_record = {
                                 'Pasta': prefix,
                                 'Arquivo': os.path.basename(key),
-                                'Data Modificação': last_modified.strftime('%d/%m/%Y'), # Adicionei a data para conferência
+                                'Status Identificação': status_identificacao,
+                                'Data Modificação': last_modified.strftime('%d/%m/%Y'),
                                 'CNPJs': ", ".join(info['CNPJs']),
                                 'Empresas (Estimado)': ", ".join(info['Possiveis Empresas']),
-                                'Linhas de Contexto (Tomador/Empresa)': " | ".join(info['Linhas de Contexto']),
+                                'Linhas de Contexto': " | ".join(info['Linhas de Contexto']),
                                 'Emails': ", ".join(info['Emails']),
                                 'CPFs': ", ".join(info['CPFs']),
                                 'Texto Inicial (OCR)': full_text[:100].replace('\n', ' ') 
@@ -243,8 +282,8 @@ def run():
         for f in stats['files_data']:
             if f['CNPJs']: cnpjs_set.update(f['CNPJs'].split(', '))
             if f['Empresas (Estimado)']: companies_set.update(f['Empresas (Estimado)'].split(', '))
-            if f['Linhas de Contexto (Tomador/Empresa)']:
-                 context_set.add(f['Linhas de Contexto (Tomador/Empresa)'][:50] + "...")
+            if f['Linhas de Contexto']:
+                 context_set.add(f['Linhas de Contexto'][:50] + "...")
             
             all_files_details.append(f)
 
@@ -253,7 +292,7 @@ def run():
             'Pasta': folder,
             'Total de Arquivos (S3)': stats['total_files'],
             'Arquivos Lidos (Recentes)': stats['ocr_performed'],
-            'CNPJs Identificados na Pasta': ", ".join(list(cnpjs_set)),
+            'CNPJs Identificados': ", ".join(list(cnpjs_set)),
             'Empresas Identificadas': ", ".join(list(companies_set)),
             'Contexto Geral': " | ".join(list(context_set))[:500] 
         }
@@ -272,6 +311,12 @@ def run():
             # Aba 2: Detalhe Técnico (Uma linha por arquivo lido)
             if all_files_details:
                 df_details = pd.DataFrame(all_files_details)
+                # Reordenar colunas para o Status ficar visível no começo
+                cols = ['Pasta', 'Arquivo', 'Status Identificação', 'Data Modificação', 'CNPJs', 'Empresas (Estimado)', 'Linhas de Contexto', 'Emails', 'CPFs', 'Texto Inicial (OCR)']
+                # Filtra apenas colunas que existem (segurança)
+                cols = [c for c in cols if c in df_details.columns]
+                df_details = df_details[cols]
+                
                 df_details.to_excel(writer, sheet_name='Detalhe por Arquivo', index=False)
             else:
                 # Cria aba vazia se nada foi lido
@@ -279,10 +324,10 @@ def run():
 
         print("✅ Relatório gerado com sucesso!")
         print("   -> Aba 'Resumo por Pasta': Visão geral dos donos das pastas.")
-        print("   -> Aba 'Detalhe por Arquivo': Coluna 'Linhas de Contexto' adicionada.")
+        print("   -> Aba 'Detalhe por Arquivo': Status explícito e Contexto adicionados.")
 
     except Exception as e:
         print(f"❌ Erro ao salvar Excel: {e}")
 
 if __name__ == "__main__":
-    run()
+    run()   
