@@ -7,15 +7,16 @@ import io
 import logging
 from dotenv import load_dotenv
 from tqdm import tqdm
-# --- Imports para lidar com datas ---
 from datetime import datetime, timedelta, timezone
+from botocore.config import Config
+# --- NOVO: Imports para tratar erros de conexão especificamente ---
+from botocore.exceptions import EndpointConnectionError, ConnectTimeoutError, ClientError
 
 # ================= CONFIGURAÇÕES =================
 load_dotenv()
 BUCKET_NAME = os.getenv('BUCKET_NAME')
 
-# --- 1. LISTA DE PASTAS ALVO (Cole sua lista aqui) ---
-# O script vai olhar APENAS para estas pastas.
+# --- 1. LISTA DE PASTAS ALVO ---
 TARGET_FOLDERS = [
     "000000000000011/000000000000735",
     "000000000000011/000000000000738",
@@ -36,14 +37,13 @@ TARGET_FOLDERS = [
     "000000000000011/000000000000755"
 ]
 
-# --- 2. TRAVA DE SEGURANÇA (Custo AWS Textract) ---
-# Quantos arquivos RECENTES POR PASTA vamos ler?
+# --- 2. TRAVA DE SEGURANÇA ---
 SAMPLES_PER_FOLDER = 80 
 
 OUTPUT_FILE = 'relatorio_final_clientes.xlsx'
 LOG_FILE = 'log_ocr_direct.log'
 
-# Extensões válidas para OCR
+# Extensões válidas
 VALID_EXTS = ('.pdf', '.png', '.jpg', '.jpeg', '.tiff')
 
 # ================= LOGGING =================
@@ -57,45 +57,35 @@ logging.basicConfig(
 # ================= FUNÇÕES DE EXTRAÇÃO =================
 
 def extract_info_from_text(text):
-    """
-    Tenta extrair CNPJ, CPF, E-mail e possíveis Nomes de Empresa do texto cru.
-    """
     info = {
         'CNPJs': [],
         'CPFs': [],
         'Emails': [],
         'Possiveis Empresas': [],
-        'Linhas de Contexto': [] # Nova lista para salvar frases inteiras
+        'Linhas de Contexto': []
     }
     
-    # Lista de palavras-chave para capturar a linha inteira
     KEYWORDS_CONTEXTO = [
         'TOMADOR', 'PRESTADOR', 'EMPRESA', 'RAZÃO SOCIAL', 'RAZAO SOCIAL',
         'COMPROVANTE', 'DESTINATÁRIO', 'DESTINATARIO', 'BENEFICIÁRIO', 
         'PAGADOR', 'CLIENTE', 'FORNECEDOR', 'LTDA', 'S.A.', 'S/A', 'EIRELI'
     ]
 
-    # Quebra o texto em linhas para analisar uma por uma
     lines = text.split('\n')
 
     for line in lines:
         upper_line = line.upper()
-        
-        # --- 1. Busca por Contexto ---
         if any(key in upper_line for key in KEYWORDS_CONTEXTO):
-            # Limpa caracteres muito sujos do OCR para ficar legível no Excel
             clean_context = re.sub(r'\s+', ' ', line).strip()
-            if len(clean_context) > 5: # Ignora lixo muito curto
+            if len(clean_context) > 5:
                 info['Linhas de Contexto'].append(clean_context)
 
-        # --- 2. Heurística de Razão Social ---
         company_suffixes = [' LTDA', ' S.A.', ' S/A', ' EIRELI', ' ME', ' EPP']
         if any(suf in upper_line for suf in company_suffixes):
             clean_name = re.sub(r'[^\w\s\.\/\-&]', '', line).strip()
             if len(clean_name) > 3 and clean_name not in info['Possiveis Empresas']:
                 info['Possiveis Empresas'].append(clean_name)
 
-    # --- 3. Regex CNPJ ---
     cnpj_pattern = r'\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b'
     raw_cnpjs = re.findall(cnpj_pattern, text)
     for c in raw_cnpjs:
@@ -104,7 +94,6 @@ def extract_info_from_text(text):
             formatted = f"{clean[:2]}.{clean[2:5]}.{clean[5:8]}/{clean[8:12]}-{clean[12:]}"
             if formatted not in info['CNPJs']: info['CNPJs'].append(formatted)
 
-    # --- 4. Regex CPF ---
     cpf_pattern = r'\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b'
     raw_cpfs = re.findall(cpf_pattern, text)
     for c in raw_cpfs:
@@ -113,7 +102,6 @@ def extract_info_from_text(text):
             formatted = f"{clean[:3]}.{clean[3:6]}.{clean[6:9]}-{clean[9:]}"
             if formatted not in info['CPFs']: info['CPFs'].append(formatted)
 
-    # --- 5. Regex Email ---
     email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
     info['Emails'] = list(set(re.findall(email_pattern, text)))
 
@@ -123,8 +111,9 @@ def extract_info_from_text(text):
 
 def get_aws_clients():
     """
-    Cria e retorna os clientes S3 e Textract com credenciais EXPLÍCITAS.
-    Isso corrige o erro 'NoRegionError'.
+    Cria clientes AWS com configuração de 'FAIL FAST'.
+    Se a rede estiver ruim, ele falha em 2 segundos e não tenta de novo,
+    evitando que o script trave.
     """
     aws_access_key = os.getenv('AWS_ACCESS_KEY_ID')
     aws_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
@@ -133,28 +122,34 @@ def get_aws_clients():
     if not aws_access_key or not aws_secret_key or not aws_region:
         raise ValueError("ERRO: Credenciais AWS ou Região não encontradas no .env")
 
-    # Configuração explícita da sessão
+    # --- CONFIGURAÇÃO ROBUSTA ---
+    my_config = Config(
+        region_name=aws_region,
+        retries={
+            'max_attempts': 0, # NÃO TENTA DE NOVO SE FALHAR (Evita travamento)
+            'mode': 'standard'
+        },
+        connect_timeout=2, # Desiste se não conectar em 2 segundos
+        read_timeout=30
+    )
+
     s3_client = boto3.client(
         's3',
         aws_access_key_id=aws_access_key,
         aws_secret_access_key=aws_secret_key,
-        region_name=aws_region
+        config=my_config
     )
     
     textract_client = boto3.client(
         'textract',
         aws_access_key_id=aws_access_key,
         aws_secret_access_key=aws_secret_key,
-        region_name=aws_region
+        config=my_config
     )
     
     return s3_client, textract_client
 
 def analyze_folder(s3, textract, folder):
-    """
-    Analisa uma pasta específica: Conta total e faz OCR na amostra RECENTE.
-    """
-    # Normaliza nome da pasta
     prefix = folder.strip()
     if not prefix.endswith('/') and prefix: prefix += '/'
     
@@ -163,16 +158,19 @@ def analyze_folder(s3, textract, folder):
     stats = {
         'total_files': 0,
         'ocr_performed': 0,
-        'files_data': [] # Lista com detalhes de cada arquivo lido
+        'files_data': []
     }
 
-    # --- DEFINIÇÃO DE DATA DE CORTE ---
-    # 90 dias atrás a partir de hoje (UTC, pois o S3 usa UTC)
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=90)
-    print(f"   📅 Filtro de Data Ativo: Apenas arquivos posteriores a {cutoff_date.strftime('%d/%m/%Y')}")
+    print(f"   📅 Filtro de Data: >= {cutoff_date.strftime('%d/%m/%Y')}")
 
     paginator = s3.get_paginator('list_objects_v2')
-    page_iterator = paginator.paginate(Bucket=BUCKET_NAME, Prefix=prefix)
+    # Adicionado tratamento de erro na listagem também
+    try:
+        page_iterator = paginator.paginate(Bucket=BUCKET_NAME, Prefix=prefix)
+    except (EndpointConnectionError, ConnectTimeoutError):
+        print("   ❌ ERRO DE CONEXÃO: Não foi possível listar arquivos desta pasta.")
+        return stats
 
     try:
         for page in page_iterator:
@@ -180,57 +178,41 @@ def analyze_folder(s3, textract, folder):
 
             for obj in page['Contents']:
                 key = obj['Key']
-                if key.endswith('/'): continue # Ignora a própria pasta
+                if key.endswith('/'): continue
                 
                 stats['total_files'] += 1
                 
-                # --- FILTRO DE DATA ---
                 last_modified = obj['LastModified']
                 if last_modified < cutoff_date:
-                    # Se for antigo, ignora silenciosamente e vai pro próximo
                     continue
-                # ----------------------------
 
-                # --- LÓGICA DE AMOSTRAGEM ---
-                # Se ainda não atingimos o limite de OCR para essa pasta, lemos o arquivo
                 if stats['ocr_performed'] < SAMPLES_PER_FOLDER:
                     _, ext = os.path.splitext(key)
                     if ext.lower() in VALID_EXTS:
                         
-                        print(f"   👁️  Lendo arquivo RECENTE [{stats['ocr_performed']+1}/{SAMPLES_PER_FOLDER}]: {os.path.basename(key)}")
+                        print(f"   👁️  Lendo RECENTE [{stats['ocr_performed']+1}]: {os.path.basename(key)}")
                         
                         try:
-                            # 1. Baixar (Memória)
                             file_stream = io.BytesIO()
                             s3.download_fileobj(BUCKET_NAME, key, file_stream)
                             file_bytes = file_stream.getvalue()
 
-                            # 2. Validar Tamanho (Textract Sync max 5MB)
                             if len(file_bytes) > 5 * 1024 * 1024:
-                                logging.warning(f"Arquivo ignorado (muito grande): {key}")
+                                logging.warning(f"Ignorado (Grande): {key}")
                                 continue
 
-                            # 3. OCR (Textract)
                             response = textract.detect_document_text(Document={'Bytes': file_bytes})
                             full_text = "\n".join([b['Text'] for b in response['Blocks'] if b['BlockType'] == 'LINE'])
                             
-                            # 4. Extrair Dados
                             info = extract_info_from_text(full_text)
                             
-                            # --- VERIFICAÇÃO DE SUCESSO/FALHA ---
-                            # Verifica se encontrou ALGUMA coisa útil
                             has_data = any([
-                                info['CNPJs'], 
-                                info['CPFs'], 
-                                info['Emails'], 
-                                info['Possiveis Empresas'], 
-                                info['Linhas de Contexto']
+                                info['CNPJs'], info['CPFs'], info['Emails'], 
+                                info['Possiveis Empresas'], info['Linhas de Contexto']
                             ])
                             
                             status_identificacao = "SUCESSO" if has_data else "NENHUM DADO ENCONTRADO"
-                            # ------------------------------------
 
-                            # 5. Salvar Dados do Arquivo
                             file_record = {
                                 'Pasta': prefix,
                                 'Arquivo': os.path.basename(key),
@@ -245,13 +227,31 @@ def analyze_folder(s3, textract, folder):
                             }
                             stats['files_data'].append(file_record)
                             stats['ocr_performed'] += 1
+                        
+                        # --- TRATAMENTO DE ERROS DE CONEXÃO ESPECÍFICOS ---
+                        except (EndpointConnectionError, ConnectTimeoutError) as e:
+                            # Se a rede cair, ele avisa e pula para o próximo sem travar
+                            print(f"      ❌ FALHA DE REDE (Textract): {e}. Pulando arquivo...")
+                            logging.error(f"Erro de Conexão em {key}: {e}")
                             
-                        except Exception as e:
-                            logging.error(f"Erro ao ler {key}: {e}")
-                            print(f"      ❌ Erro na leitura: {e}")
+                            # Opcional: Adicionar linha de erro no Excel para você saber
+                            file_record = {
+                                'Pasta': prefix,
+                                'Arquivo': os.path.basename(key),
+                                'Status Identificação': "ERRO DE CONEXÃO / REDE",
+                                'Data Modificação': last_modified.strftime('%d/%m/%Y')
+                            }
+                            stats['files_data'].append(file_record)
+                            continue
 
+                        except Exception as e:
+                            logging.error(f"Erro genérico ao ler {key}: {e}")
+                            print(f"      ❌ Erro genérico: {e}")
+
+    except (EndpointConnectionError, ConnectTimeoutError) as e:
+        print(f"❌ Erro Crítico de Rede na pasta {prefix}: {e}")
     except Exception as e:
-        print(f"❌ Erro crítico acessando a pasta {prefix}: {e}")
+        print(f"❌ Erro Crítico na pasta {prefix}: {e}")
         logging.error(f"Erro pasta {prefix}: {e}")
 
     return stats
@@ -263,34 +263,36 @@ def run():
         print("ERRO: Configure BUCKET_NAME no .env")
         return
 
-    s3, textract = get_aws_clients()
+    try:
+        s3, textract = get_aws_clients()
+    except Exception as e:
+        print(f"❌ Erro fatal na conexão inicial AWS: {e}")
+        return
     
     all_files_details = []
     folder_summaries = []
 
     print(f"🚀 Iniciando análise direta em {len(TARGET_FOLDERS)} pastas.")
-    print(f"💰 Limite de leitura: {SAMPLES_PER_FOLDER} arquivos por pasta (Custo controlado).")
+    print(f"💰 Limite: {SAMPLES_PER_FOLDER} arqs/pasta. (Modo Fail Fast ativo)")
 
     for folder in tqdm(TARGET_FOLDERS, desc="Progresso Geral"):
         stats = analyze_folder(s3, textract, folder)
         
-        # Consolida os CNPJs encontrados nessa pasta (para o resumo)
         cnpjs_set = set()
         companies_set = set()
         context_set = set()
         
         for f in stats['files_data']:
-            if f['CNPJs']: cnpjs_set.update(f['CNPJs'].split(', '))
-            if f['Empresas (Estimado)']: companies_set.update(f['Empresas (Estimado)'].split(', '))
-            if f['Linhas de Contexto']:
+            if 'CNPJs' in f and f['CNPJs']: cnpjs_set.update(f['CNPJs'].split(', '))
+            if 'Empresas (Estimado)' in f and f['Empresas (Estimado)']: companies_set.update(f['Empresas (Estimado)'].split(', '))
+            if 'Linhas de Contexto' in f and f['Linhas de Contexto']:
                  context_set.add(f['Linhas de Contexto'][:50] + "...")
             
             all_files_details.append(f)
 
-        # Cria linha de resumo
         summary = {
             'Pasta': folder,
-            'Total de Arquivos (S3)': stats['total_files'],
+            'Total Arquivos (S3)': stats['total_files'],
             'Arquivos Lidos (Recentes)': stats['ocr_performed'],
             'CNPJs Identificados': ", ".join(list(cnpjs_set)),
             'Empresas Identificadas': ", ".join(list(companies_set)),
@@ -298,36 +300,32 @@ def run():
         }
         folder_summaries.append(summary)
 
-    # ================= GERAR RELATÓRIO EXCEL =================
     print(f"\n💾 Gerando relatório final: {OUTPUT_FILE}...")
     
     try:
         with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
             
-            # Aba 1: Resumo Gerencial (Uma linha por pasta)
             df_summary = pd.DataFrame(folder_summaries)
             df_summary.to_excel(writer, sheet_name='Resumo por Pasta', index=False)
             
-            # Aba 2: Detalhe Técnico (Uma linha por arquivo lido)
             if all_files_details:
                 df_details = pd.DataFrame(all_files_details)
-                # Reordenar colunas para o Status ficar visível no começo
-                cols = ['Pasta', 'Arquivo', 'Status Identificação', 'Data Modificação', 'CNPJs', 'Empresas (Estimado)', 'Linhas de Contexto', 'Emails', 'CPFs', 'Texto Inicial (OCR)']
-                # Filtra apenas colunas que existem (segurança)
-                cols = [c for c in cols if c in df_details.columns]
-                df_details = df_details[cols]
                 
+                # Garante que as colunas existam (no caso de erro de conexão, algumas podem faltar)
+                cols_order = ['Pasta', 'Arquivo', 'Status Identificação', 'Data Modificação', 'CNPJs', 'Empresas (Estimado)', 'Linhas de Contexto', 'Emails', 'CPFs', 'Texto Inicial (OCR)']
+                # Cria colunas vazias se não existirem
+                for c in cols_order:
+                    if c not in df_details.columns: df_details[c] = ""
+                
+                df_details = df_details[cols_order]
                 df_details.to_excel(writer, sheet_name='Detalhe por Arquivo', index=False)
             else:
-                # Cria aba vazia se nada foi lido
                 pd.DataFrame(['Nenhum arquivo recente compatível lido']).to_excel(writer, sheet_name='Detalhe por Arquivo')
 
         print("✅ Relatório gerado com sucesso!")
-        print("   -> Aba 'Resumo por Pasta': Visão geral dos donos das pastas.")
-        print("   -> Aba 'Detalhe por Arquivo': Status explícito e Contexto adicionados.")
 
     except Exception as e:
         print(f"❌ Erro ao salvar Excel: {e}")
 
 if __name__ == "__main__":
-    run()   
+    run()
